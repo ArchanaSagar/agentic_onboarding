@@ -1,809 +1,644 @@
-"""
-Complete Project Onboarding Agent with LangGraph
-Follows the defined user journey with proper state management
-"""
-
-from typing import TypedDict, Annotated, List, Optional, Literal
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_openai import AzureChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-from dotenv import load_dotenv
-import operator
 import os
+import requests
+from dotenv import load_dotenv
+from typing import TypedDict, Annotated, List, Literal
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.vectorstores import FAISS
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.tools import tool
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
 import json
-import re
+from datetime import datetime
 
+# ==============================
+# 0. Load Environment Variables
+# ==============================
 load_dotenv()
 
-# ============================================================================
-# STATE DEFINITION
-# ============================================================================
+# ==============================
+# 1. Initialize LLM
+# ==============================
+llm = AzureChatOpenAI(
+    azure_endpoint=os.getenv("OPENAI_AZURE_ENDPOINT"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+    api_version=os.getenv("OPENAI_API_VERSION"),
+    model=os.getenv("OPENAI_MODEL_NAME", "gpt-4"),
+    temperature=0.7
+)
 
-class OnboardingState(TypedDict):
-    """Complete state tracking for onboarding journey"""
-    # Conversation history
-    messages: Annotated[List, operator.add]
+embeddings = AzureOpenAIEmbeddings(
+    azure_endpoint=os.getenv("OPENAI_AZURE_ENDPOINT"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+    api_version=os.getenv("OPENAI_API_VERSION"),
+    model="text-embedding-3-large"
+)
+
+# Global storage
+vectorstore_docs = None
+vectorstore_code = None
+
+# ==============================
+# 2. Initialize Knowledge Base
+# ==============================
+def initialize_knowledge_base():
+    """Initialize vector stores for documentation and code"""
+    global vectorstore_docs, vectorstore_code
     
-    # User profile
-    domain: Optional[str]
-    role: Optional[str]
-    
-    # Learning context
-    learning_topic: Optional[str]  # keyword/feature ID/PBI
-    project_summary: Optional[str]
-    learning_materials: List[dict]
-    
-    # Quiz state
-    quiz_ready: bool
-    quiz_questions: List[dict]
-    quiz_answers: List[str]
-    feedback: Optional[str]
-    
-    # Team contacts
-    team_contact: Optional[dict]
-    
-    # Flow control
-    next_action: Optional[str]
-    user_input: Optional[str]
-
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-# Mock project data (replace with actual data source)
-PROJECT_DATA = {
-    "backend": {
-        "summary": """
-        **Backend Team Overview:**
-        Our backend infrastructure powers a microservices architecture handling 10M+ daily requests.
-        - Tech Stack: Python (FastAPI), Node.js, PostgreSQL, Redis, Kafka
-        - Key Services: User Auth, Payment Processing, Data Pipeline, API Gateway
-        - Recent Focus: Migration to event-driven architecture and improved observability
-        """,
-        "materials": {
-            "authentication": {
-                "title": "OAuth2 Implementation Guide",
-                "url": "https://github.com/company/backend-auth",
-                "content": "Step-by-step OAuth2 setup with FastAPI and JWT tokens for secure authentication"
-            },
-            "kafka": {
-                "title": "Event Streaming with Kafka",
-                "url": "https://github.com/company/kafka-setup",
-                "content": "Producer/Consumer patterns and best practices for event-driven architecture"
-            }
-        },
-        "contact": {
-            "name": "Sarah Chen",
-            "role": "Backend Team Lead",
-            "email": "sarah.chen@company.com",
-            "slack": "@sarah"
-        }
-    },
-    "frontend": {
-        "summary": """
-        **Frontend Team Overview:**
-        We build responsive, accessible web applications using modern frameworks.
-        - Tech Stack: React 18, TypeScript, Next.js, TailwindCSS, React Query
-        - Key Focus: Component library, performance optimization, accessibility (WCAG 2.1)
-        - Recent Work: Design system migration and micro-frontend architecture
-        """,
-        "materials": {
-            "components": {
-                "title": "Design System Components",
-                "url": "https://github.com/company/design-system",
-                "content": "Reusable React components with Storybook documentation and accessibility features"
-            },
-            "state-management": {
-                "title": "State Management Patterns",
-                "url": "https://github.com/company/react-patterns",
-                "content": "Context, Redux Toolkit, and React Query patterns for scalable state management"
-            }
-        },
-        "contact": {
-            "name": "Mike Rodriguez",
-            "role": "Frontend Team Lead",
-            "email": "mike.rodriguez@company.com",
-            "slack": "@mike"
-        }
-    },
-    "data": {
-        "summary": """
-        **Data Science Team Overview:**
-        We build ML models and data pipelines for analytics and personalization.
-        - Tech Stack: Python, PyTorch, Airflow, Snowflake, DBT, MLflow
-        - Key Projects: Recommendation engine, churn prediction, A/B testing platform
-        - Recent Focus: MLOps maturity and real-time feature stores
-        """,
-        "materials": {
-            "ml-pipeline": {
-                "title": "ML Pipeline Architecture",
-                "url": "https://github.com/company/ml-pipelines",
-                "content": "End-to-end ML workflow from training to deployment with MLOps best practices"
-            },
-            "feature-store": {
-                "title": "Feature Store Setup",
-                "url": "https://github.com/company/feature-store",
-                "content": "Real-time and batch feature engineering patterns for ML models"
-            }
-        },
-        "contact": {
-            "name": "Dr. Priya Sharma",
-            "role": "Data Science Lead",
-            "email": "priya.sharma@company.com",
-            "slack": "@priya"
-        }
-    }
-}
-
-# ============================================================================
-# LLM SETUP WITH PROMPTS
-# ============================================================================
-
-def get_llm(temperature=0.7):
-    """Initialize LLM with Azure OpenAI configuration"""
-    return AzureChatOpenAI(
-        azure_endpoint=os.getenv("OPENAI_AZURE_ENDPOINT"),
-        api_key=os.getenv("OPENAI_API_KEY"),
-        api_version=os.getenv("OPENAI_API_VERSION"),
-        model_name=os.getenv("OPENAI_MODEL_NAME"),
-        temperature=temperature
-    )
-
-
-# Prompt templates for each stage
-COLLECT_INFO_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a friendly onboarding assistant. Your job is to collect the user's domain and role.
-
-Ask about:
-1. Domain: backend, frontend, or data
-2. Role: junior developer, senior engineer, lead, etc.
-
-Be conversational and warm. If the user provides one piece of info, ask for the other."""),
-    MessagesPlaceholder(variable_name="history"),
-    ("human", "{input}")
-])
-
-SUMMARY_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are presenting a project summary to a new team member.
-
-Domain: {domain}
-Role: {role}
-
-Here's the summary:
-{summary}
-
-Present this in a welcoming way, then ask what specific topic they'd like to learn about.
-Suggest they can ask about:
-- Specific keywords (e.g., "authentication", "components", "ml-pipeline")
-- Feature IDs or PBIs
-- General areas of interest"""),
-    MessagesPlaceholder(variable_name="history"),
-    ("human", "{input}")
-])
-
-MATERIAL_SEARCH_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are helping find learning materials based on user's topic request: {topic}
-
-Available materials for {domain} domain:
-{materials_list}
-
-If the topic matches available materials, present them enthusiastically.
-If no match, be honest and offer to connect them with the team lead."""),
-    MessagesPlaceholder(variable_name="history"),
-    ("human", "{input}")
-])
-
-QUIZ_INTRO_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """The user has finished learning about {topic}. 
-
-Ask if they'd like to take a quick 2-question quiz to test their understanding.
-Be encouraging and emphasize it's just for learning, not evaluation."""),
-    MessagesPlaceholder(variable_name="history"),
-    ("human", "{input}")
-])
-
-QUIZ_GENERATION_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", """You are a quiz generator for technical onboarding.
-
-Generate 2 multiple-choice questions based on the following learning material:
-
-**Domain:** {domain}
-**Topic:** {topic}
-**Material Content:** {material_content}
-**Project Summary:** {project_summary}
-
-Requirements:
-- Create 2 questions that test understanding of key concepts
-- Each question should have 4 options (A, B, C, D)
-- Questions should be practical and relevant to the role
-- Include the correct answer and a clear explanation
-
-Return ONLY valid JSON in this exact format (no markdown, no preamble):
-[
-  {{
-    "question": "Question text here?",
-    "options": ["A) Option 1", "B) Option 2", "C) Option 3", "D) Option 4"],
-    "correct": "B",
-    "explanation": "Explanation of why this is correct and others are wrong"
-  }},
-  {{
-    "question": "Second question text?",
-    "options": ["A) Option 1", "B) Option 2", "C) Option 3", "D) Option 4"],
-    "correct": "C",
-    "explanation": "Explanation here"
-  }}
-]"""),
-    ("human", "Generate the quiz now.")
-])
-
-
-# ============================================================================
-# NODE FUNCTIONS
-# ============================================================================
-
-def collect_domain_role(state: OnboardingState) -> OnboardingState:
-    """Node 1: Collect domain and role from user"""
-    print("\n--- COLLECT DOMAIN & ROLE ---")
-    
-    # Check if we already have both - if yes, skip to summary
-    if state.get("domain") and state.get("role"):
-        print(f"Already have domain: {state.get('domain')}, role: {state.get('role')}")
-        return {"next_action": "present_summary"}
-    
-    user_input = state.get("user_input", "")
-    
-    # Skip LLM call if user_input is empty (first run)
-    if not user_input or user_input == "Hello":
-        return {
-            "messages": [AIMessage(content="Hello! What domain will you be working in (backend, frontend, or data) and what's your role?")],
-            "next_action": "collect_info"
-        }
-    
-    # Try to extract domain and role from user input (flexible keyword matching)
-    domain_keywords = {"backend", "frontend", "front-end", "front end", "data", "data science"}
-    role_keywords = {
-        "junior", "senior", "lead", "developer", "engineer", "dev", 
-        "architect", "manager", "intern", "principal"
-    }
-    
-    user_lower = user_input.lower()
-    extracted_domain = state.get("domain")  # Keep existing if already set
-    extracted_role = state.get("role")  # Keep existing if already set
-    
-    # Extract domain if not already set
-    if not extracted_domain:
-        for domain in domain_keywords:
-            if domain in user_lower:
-                # Normalize domain names
-                if "front" in domain:
-                    extracted_domain = "frontend"
-                elif "data" in domain:
-                    extracted_domain = "data"
-                else:
-                    extracted_domain = domain
-                break
-    
-    # Extract role if not already set - look for any role keyword
-    if not extracted_role:
-        for role in role_keywords:
-            if role in user_lower:
-                extracted_role = role
-                break
-    
-    print(f"Extracted - Domain: {extracted_domain}, Role: {extracted_role}")
-    
-    # If we couldn't extract either, provide options
-    if not extracted_domain or not extracted_role:
-        missing_info = []
-        if not extracted_domain:
-            missing_info.append("domain")
-        if not extracted_role:
-            missing_info.append("role")
+    print("\n🔄 Initializing knowledge base...")
+    try:
+        loader_docs = WebBaseLoader("https://docs.frappe.io/erpnext/introduction")
+        docs = loader_docs.load()
         
-        response = f"I couldn't identify your {' and '.join(missing_info)}. Let me help!\n\n"
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, 
+            chunk_overlap=100
+        )
+        split_docs = text_splitter.split_documents(docs)
         
-        if not extracted_domain:
-            response += "**Available Domains:**\n"
-            response += "1. Backend - Server-side development, APIs, databases\n"
-            response += "2. Frontend - User interfaces, web applications\n"
-            response += "3. Data - Data science, ML, analytics\n\n"
-        
-        if not extracted_role:
-            response += "**Common Roles:**\n"
-            response += "- Junior Developer/Engineer\n"
-            response += "- Senior Developer/Engineer\n"
-            response += "- Lead/Team Lead\n"
-            response += "- Architect\n"
-            response += "- Manager\n\n"
-        
-        response += "Please tell me your domain and role (e.g., 'backend senior developer' or 'frontend lead')."
-        
-        return {
-            "messages": [AIMessage(content=response)],
-            "domain": extracted_domain,
-            "role": extracted_role,
-            "next_action": "collect_info"
-        }
-    
-    # Use LLM for friendly response when we have the info
-    llm = get_llm(temperature=0.7)
-    chain = COLLECT_INFO_PROMPT | llm | StrOutputParser()
-    history = state.get("messages", [])
-    
-    response = chain.invoke({
-        "history": history,
-        "input": user_input
-    })
-    
-    # Build updates
-    updates = {
-        "messages": [AIMessage(content=response)],
-        "domain": extracted_domain,
-        "role": extracted_role
-    }
-    
-    # Decide next action based on what we have
-    if extracted_domain and extracted_role:
-        print("Both found! Moving to present_summary")
-        updates["next_action"] = "present_summary"
-    else:
-        print(f"Missing - Domain: {not extracted_domain}, Role: {not extracted_role}")
-        updates["next_action"] = "collect_info"
-    
-    return updates
+        vectorstore_docs = FAISS.from_documents(split_docs, embeddings)
+        vectorstore_code = vectorstore_docs  # Placeholder
+        print("✅ Knowledge base ready!\n")
+    except Exception as e:
+        print(f"⚠️  Using fallback knowledge base: {e}\n")
+        from langchain_core.documents import Document
+        fallback_docs = [
+            Document(page_content="""ERPNext is a comprehensive open-source ERP system with the following modules:
+            - Accounting: Financial management, invoicing, payments, reports
+            - HR & Payroll: Employee management, attendance, payroll processing
+            - Manufacturing: Production planning, BOM, work orders
+            - Sales & CRM: Customer management, sales orders, quotations
+            - Purchase & Inventory: Supplier management, stock, warehouses
+            - Projects: Project management, tasks, timesheets
+            - Healthcare: Patient management, appointments, medical records"""),
+            
+            Document(page_content="""Common roles in ERPNext implementation:
+            - Developer: Customization, API integration, custom apps
+            - Tester/QA: Testing workflows, bug reporting, quality assurance
+            - Business Analyst: Requirements gathering, process documentation
+            - Solution Architect: System design, technical decisions
+            - System Administrator: Server setup, deployment, maintenance
+            - Functional Consultant: Business process configuration
+            - End User: Daily operations, data entry, report generation"""),
+        ]
+        vectorstore_docs = FAISS.from_documents(fallback_docs, embeddings)
+        vectorstore_code = vectorstore_docs
 
+# ==============================
+# 3. Define Tools
+# ==============================
 
-def present_summary(state: OnboardingState) -> OnboardingState:
-    """Node 2: Present project summary based on domain/role"""
-    print("\n--- PRESENT SUMMARY ---")
+@tool
+def search_documentation(query: str) -> str:
+    """Search ERPNext documentation for relevant information."""
+    if vectorstore_docs is None:
+        return "Knowledge base not initialized."
     
-    domain = state.get("domain", "backend")
-    role = state.get("role", "team member")
+    retriever = vectorstore_docs.as_retriever(search_kwargs={"k": 3})
+    docs = retriever.get_relevant_documents(query)
     
-    # Get domain-specific summary
-    summary = PROJECT_DATA.get(domain, PROJECT_DATA["backend"])["summary"]
+    if not docs:
+        return "No relevant documentation found."
     
-    llm = get_llm(temperature=0.7)
-    chain = SUMMARY_PROMPT | llm | StrOutputParser()
-    
-    response = chain.invoke({
-        "domain": domain,
-        "role": role,
-        "summary": summary,
-        "history": state.get("messages", []),
-        "input": state.get("user_input", "")
-    })
-    
-    return {
-        "project_summary": summary,
-        "messages": [AIMessage(content=response)],
-        "next_action": "search_materials"
-    }
+    return "\n\n---\n\n".join([doc.page_content for doc in docs])[:3000]
 
+@tool
+def search_code_examples(query: str) -> str:
+    """Search for code examples and implementation patterns."""
+    if vectorstore_code is None:
+        return "Code repository not available."
+    
+    retriever = vectorstore_code.as_retriever(search_kwargs={"k": 2})
+    docs = retriever.get_relevant_documents(query)
+    
+    if not docs:
+        return "No code examples found."
+    
+    return "\n\n".join([doc.page_content for doc in docs])[:2000]
 
-def search_materials(state: OnboardingState) -> OnboardingState:
-    """Node 3: Search for learning materials based on topic"""
-    print("\n--- SEARCH MATERIALS ---")
-    
-    user_input = state.get("user_input", "").lower()
-    domain = state.get("domain", "backend")
-    
-    # Get available materials for domain
-    domain_data = PROJECT_DATA.get(domain, PROJECT_DATA["backend"])
-    available_materials = domain_data.get("materials", {})
-    
-    # Search for matching material
-    found_material = None
-    for keyword, material in available_materials.items():
-        if keyword in user_input or user_input in keyword:
-            found_material = material
-            state["learning_topic"] = keyword
-            break
-    
-    # Prepare materials list for LLM
-    materials_list = "\n".join([
-        f"- {keyword}: {mat['title']}"
-        for keyword, mat in available_materials.items()
-    ])
-    
-    llm = get_llm(temperature=0.7)
-    chain = MATERIAL_SEARCH_PROMPT | llm | StrOutputParser()
-    
-    response = chain.invoke({
-        "topic": user_input,
-        "domain": domain,
-        "materials_list": materials_list,
-        "history": state.get("messages", []),
-        "input": user_input
-    })
-    
-    if found_material:
-        # Material found - present it
-        material_details = f"\n\n📚 **{found_material['title']}**\n"
-        material_details += f"🔗 Repository: {found_material['url']}\n"
-        material_details += f"📝 Overview: {found_material['content']}\n"
-        
-        response += material_details
-        
-        return {
-            "learning_materials": [found_material],
-            "messages": [AIMessage(content=response)],
-            "next_action": "ask_quiz"
-        }
-    else:
-        # No material found - provide contact
-        contact = domain_data["contact"]
-        contact_info = f"\n\n👤 **Contact Information:**\n"
-        contact_info += f"Name: {contact['name']}\n"
-        contact_info += f"Role: {contact['role']}\n"
-        contact_info += f"Email: {contact['email']}\n"
-        contact_info += f"Slack: {contact['slack']}\n"
-        
-        response += contact_info
-        
-        return {
-            "team_contact": contact,
-            "messages": [AIMessage(content=response)],
-            "next_action": "ask_continue"
-        }
-
-
-def ask_quiz(state: OnboardingState) -> OnboardingState:
-    """Node 4: Ask if user wants to take a quiz"""
-    print("\n--- ASK FOR QUIZ ---")
-    
-    topic = state.get("learning_topic", "the material")
-    
-    llm = get_llm(temperature=0.7)
-    chain = QUIZ_INTRO_PROMPT | llm | StrOutputParser()
-    
-    response = chain.invoke({
-        "topic": topic,
-        "history": state.get("messages", []),
-        "input": state.get("user_input", "")
-    })
-    
-    return {
-        "messages": [AIMessage(content=response)],
-        "next_action": "wait_quiz_response"
-    }
-
-
-def present_quiz(state: OnboardingState) -> OnboardingState:
-    """Node 5: Generate and present quiz questions using LLM"""
-    print("\n--- GENERATE & PRESENT QUIZ ---")
-    
-    domain = state.get("domain", "backend")
-    topic = state.get("learning_topic", "general concepts")
-    learning_materials = state.get("learning_materials", [])
-    project_summary = state.get("project_summary", "")
-    
-    # Get material content
-    material_content = ""
-    if learning_materials:
-        material_content = learning_materials[0].get("content", "")
-    
-    # Generate quiz using LLM
-    llm = get_llm(temperature=0.7)
-    chain = QUIZ_GENERATION_PROMPT | llm | StrOutputParser()
+@tool
+def get_recent_commits(keyword: str) -> str:
+    """Get recent GitHub commits related to a topic."""
+    url = f"https://api.github.com/search/commits?q={keyword}+repo:frappe/erpnext&per_page=3"
+    headers = {"Accept": "application/vnd.github.cloak-preview"}
     
     try:
-        quiz_json = chain.invoke({
-            "domain": domain,
-            "topic": topic,
-            "material_content": material_content,
-            "project_summary": project_summary
-        })
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return "Recent commits unavailable at the moment."
         
-        # Parse JSON response with robust cleaning
-        cleaned_json = quiz_json.strip()
+        commits = response.json().get("items", [])
+        if not commits:
+            return f"No recent commits found for: {keyword}"
         
-        # Remove markdown code blocks if present
-        if "```" in cleaned_json:
-            # Find content between code blocks
-            match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', cleaned_json)
-            if match:
-                cleaned_json = match.group(1).strip()
-            else:
-                # Just remove all backticks
-                cleaned_json = cleaned_json.replace('```json', '').replace('```', '').strip()
+        result = []
+        for i, c in enumerate(commits, 1):
+            msg = c['commit']['message'].split('\n')[0][:100]
+            result.append(f"{i}. {msg}\n   🔗 {c['html_url']}")
         
-        # Parse the JSON
-        questions = json.loads(cleaned_json)
+        return "\n\n".join(result)
+    except:
+        return "Could not fetch recent commits."
+
+@tool
+def get_available_modules() -> str:
+    """Get list of all ERPNext modules."""
+    docs = search_documentation.invoke({"query": "ERPNext modules domains features"})
+    
+    prompt = f"""Based on this documentation:
+{docs}
+
+List the main ERPNext modules/domains. Return as JSON array of strings.
+If unclear, return: ["Accounting", "HR & Payroll", "Manufacturing", "Sales & CRM", "Purchase & Inventory", "Projects", "Healthcare", "Assets"]
+
+Return ONLY the JSON array."""
+    
+    response = llm.invoke(prompt)
+    try:
+        return response.content.strip()
+    except:
+        return '["Accounting", "HR & Payroll", "Manufacturing", "Sales & CRM", "Purchase & Inventory", "Projects", "Healthcare"]'
+
+@tool
+def get_available_roles() -> str:
+    """Get list of common team roles."""
+    return '["Developer", "QA/Tester", "Business Analyst", "Solution Architect", "System Admin", "Functional Consultant", "Project Manager", "End User"]'
+
+@tool
+def match_user_to_module(user_input: str) -> str:
+    """Match user's interest/background to best ERPNext module."""
+    modules = json.loads(get_available_modules.invoke({}))
+    
+    prompt = f"""User said: "{user_input}"
+
+Available modules: {', '.join(modules)}
+
+Which module best matches their interest? Return ONLY the exact module name."""
+    
+    response = llm.invoke(prompt)
+    match = response.content.strip()
+    
+    for module in modules:
+        if module.lower() in match.lower():
+            return module
+    
+    return modules[0]
+
+@tool
+def match_user_to_role(user_input: str) -> str:
+    """Match user's background to best role."""
+    roles = json.loads(get_available_roles.invoke({}))
+    
+    prompt = f"""User said: "{user_input}"
+
+Available roles: {', '.join(roles)}
+
+Which role best matches their background? Return ONLY the exact role name."""
+    
+    response = llm.invoke(prompt)
+    match = response.content.strip()
+    
+    for role in roles:
+        if role.lower() in match.lower():
+            return role
+    
+    return roles[0]
+
+@tool
+def create_onboarding_plan(module: str, role: str, user_name: str) -> str:
+    """Create personalized onboarding plan."""
+    docs = search_documentation.invoke({"query": f"{role} {module} responsibilities workflows"})
+    
+    prompt = f"""Create a warm, personalized onboarding plan for {user_name}, a new {role} joining the {module} team.
+
+Available information:
+{docs}
+
+Structure:
+**Welcome to the Team, {user_name}! 👋**
+
+**Your Role**: [Brief description of what a {role} does]
+
+**Your Module**: [What the {module} module does and why it matters]
+
+**Week 1 Goals** 🎯:
+- [3-4 specific, achievable goals]
+
+**Key Topics to Learn** 📚:
+1. [Topic 1] - [Why it's important]
+2. [Topic 2] - [Why it's important]
+3. [Topic 3] - [Why it's important]
+
+**Quick Wins** ⚡:
+- [2-3 things they can do immediately to contribute]
+
+**Your Learning Path**:
+I'll guide you through each topic step-by-step. Let's start whenever you're ready!
+
+Keep it encouraging, specific, and actionable. Use their name to personalize."""
+    
+    return llm.invoke(prompt).content
+
+@tool
+def create_learning_guide(topic: str, module: str, role: str) -> str:
+    """Create detailed learning guide for a topic."""
+    docs = search_documentation.invoke({"query": f"{topic} {module} {role}"})
+    code = search_code_examples.invoke({"query": topic})
+    commits = get_recent_commits.invoke({"keyword": topic})
+    
+    prompt = f"""Create an engaging learning guide for: **{topic}**
+For a {role} in {module}.
+
+Resources:
+=== Documentation ===
+{docs}
+
+=== Code Examples ===
+{code}
+
+=== Recent Updates ===
+{commits}
+
+Structure:
+**📖 What is {topic}?**
+[Clear explanation in 2-3 sentences]
+
+**🎯 Why it matters for you**
+[Relevance to their role]
+
+**🔧 How it works**
+[Step-by-step explanation]
+
+**💡 Key Concepts**
+- [Concept 1]: [Brief explanation]
+- [Concept 2]: [Brief explanation]
+
+**👨‍💻 Practical Examples**
+[Real-world scenarios they'll encounter]
+
+**⚡ Pro Tips**
+- [2-3 insider tips]
+
+**🚨 Common Pitfalls**
+- [What to watch out for]
+
+**🔗 Related Topics**
+[What to learn next]
+
+Make it conversational and practical!"""
+    
+    return llm.invoke(prompt).content
+
+@tool
+def generate_quiz(module: str, role: str, topics_covered: str) -> str:
+    """Generate interactive quiz."""
+    prompt = f"""Create a 5-question quiz for a {role} in {module}.
+Topics covered: {topics_covered}
+
+Return JSON array with this exact structure:
+[
+  {{
+    "question": "Question text?",
+    "options": ["A) First option", "B) Second option", "C) Third option", "D) Fourth option"],
+    "correct": "A",
+    "explanation": "Why A is correct and what it teaches"
+  }}
+]
+
+Make questions practical and scenario-based. Return ONLY valid JSON."""
+    
+    return llm.invoke(prompt).content
+
+@tool
+def evaluate_answers(quiz_json: str, answers_json: str, user_name: str) -> str:
+    """Evaluate quiz and provide encouraging feedback."""
+    prompt = f"""Quiz: {quiz_json}
+User answers: {answers_json}
+
+Provide warm, encouraging feedback for {user_name}:
+
+**Your Results** 🎯
+Score: [X/5 correct]
+
+**Question-by-question:**
+1. [✓ or ✗] [If wrong, explain correct answer warmly]
+2. ...
+
+**What you mastered** ⭐:
+[Topics they understood well]
+
+**Let's review together** 📚:
+[Topics to revisit, with encouragement]
+
+**You're doing great!** Keep going! 🚀
+
+Be supportive and constructive, never discouraging."""
+    
+    return llm.invoke(prompt).content
+
+@tool
+def suggest_next_topic(module: str, role: str, completed: str) -> str:
+    """Suggest what to learn next."""
+    docs = search_documentation.invoke({"query": f"{module} learning path {role}"})
+    
+    prompt = f"""User is {role} in {module}.
+Completed topics: {completed}
+
+Documentation: {docs}
+
+Suggest the next best topic to learn.
+
+Format:
+**Next up: [Topic Name]** 🎯
+
+**Why this next:**
+[1-2 sentences on why this builds on what they know]
+
+**What you'll learn:**
+- [Benefit 1]
+- [Benefit 2]
+
+**Time needed:** [Realistic estimate]
+
+Ready to dive in? Just say "yes" or "tell me about [topic]"!"""
+    
+    return llm.invoke(prompt).content
+
+@tool
+def find_team_help(module: str, topic: str) -> str:
+    """Find who can help with specific questions."""
+    prompt = f"""For questions about "{topic}" in {module}:
+
+Suggest:
+**Who can help** 👥:
+- Primary: [Role/person who knows this best]
+- Backup: [Alternative contact]
+
+**Where to ask** 💬:
+- Slack channel: #erpnext-{module.lower().replace(' ', '-')}
+- Team email: {module.lower()}@company.com
+
+**Other resources** 📚:
+- [Relevant documentation links]
+- [Community forum topics]
+
+**Pro tip**: [How to ask effective questions about this topic]"""
+    
+    return llm.invoke(prompt).content
+
+@tool
+def save_progress(user_name: str, module: str, role: str, topics: str) -> str:
+    """Save user's learning progress."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    progress = f"""
+Progress saved for {user_name}!
+Role: {role}
+Module: {module}
+Topics completed: {topics}
+Last updated: {timestamp}
+
+Keep up the great work! 🌟
+"""
+    # In production, save to database
+    return progress
+
+# ==============================
+# 4. Agent State
+# ==============================
+
+class OnboardingState(TypedDict):
+    messages: Annotated[List, "Conversation history"]
+    user_name: str
+    module: str
+    role: str
+    completed_topics: List[str]
+    current_topic: str
+    stage: str  # welcome, profile, planning, learning, quiz, complete
+    quiz_data: str
+    score: int
+
+# ==============================
+# 5. Build Agent
+# ==============================
+
+tools = [
+    search_documentation,
+    search_code_examples,
+    get_recent_commits,
+    get_available_modules,
+    get_available_roles,
+    match_user_to_module,
+    match_user_to_role,
+    create_onboarding_plan,
+    create_learning_guide,
+    generate_quiz,
+    evaluate_answers,
+    suggest_next_topic,
+    find_team_help,
+    save_progress
+]
+
+llm_with_tools = llm.bind_tools(tools)
+
+def agent_node(state: OnboardingState) -> OnboardingState:
+    """Main agent reasoning"""
+    messages = state["messages"]
+    response = llm_with_tools.invoke(messages)
+    return {"messages": messages + [response]}
+
+def tool_node(state: OnboardingState) -> OnboardingState:
+    """Execute tools"""
+    from langchain_core.messages import ToolMessage
+    
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    tool_calls = getattr(last_message, 'tool_calls', [])
+    
+    tool_messages = []
+    for tool_call in tool_calls:
+        tool_name = tool_call["name"]
+        tool_args = tool_call["args"]
         
-        # Validate the structure
-        if not isinstance(questions, list) or len(questions) == 0:
-            raise ValueError("Invalid quiz format")
-        
-        # Format quiz for display
-        quiz_text = "\n\n📝 **Quick Knowledge Check**\n\n"
-        
-        for i, q in enumerate(questions, 1):
-            quiz_text += f"**Question {i}:** {q['question']}\n"
-            for option in q['options']:
-                quiz_text += f"{option}\n"
-            quiz_text += "\n"
-        
-        quiz_text += "Please answer with the letters (e.g., 'B, C' or 'B and C')"
-        
-        return {
-            "quiz_questions": questions,
-            "messages": [AIMessage(content=quiz_text)],
-            "next_action": "evaluate_quiz"
-        }
+        for tool in tools:
+            if tool.name == tool_name:
+                result = tool.invoke(tool_args)
+                tool_messages.append(
+                    ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+                )
+                break
     
-    except json.JSONDecodeError as e:
-        print(f"JSON parsing error: {e}")
-        print(f"Raw response: {quiz_json[:200]}")
-        error_msg = "I had trouble generating the quiz format. Let's continue with other topics instead!"
-        return {
-            "messages": [AIMessage(content=error_msg)],
-            "next_action": "ask_continue"
-        }
-    except Exception as e:
-        print(f"Error generating quiz: {e}")
-        error_msg = "I had trouble generating the quiz. Let's continue with other topics instead!"
-        return {
-            "messages": [AIMessage(content=error_msg)],
-            "next_action": "ask_continue"
-        }
+    return {"messages": messages + tool_messages}
 
-
-def evaluate_quiz(state: OnboardingState) -> OnboardingState:
-    """Node 6: Evaluate quiz answers and provide feedback"""
-    print("\n--- EVALUATE QUIZ ---")
-    
-    user_answers = state.get("user_input", "").upper()
-    questions = state.get("quiz_questions", [])
-    
-    # Parse user answers (simple extraction)
-    answer_letters = re.findall(r'[A-D]', user_answers)
-    
-    # Evaluate
-    feedback_text = "\n\n✨ **Quiz Results**\n\n"
-    correct_count = 0
-    
-    for i, q in enumerate(questions):
-        user_answer = answer_letters[i] if i < len(answer_letters) else "?"
-        is_correct = user_answer == q['correct']
-        
-        if is_correct:
-            correct_count += 1
-            feedback_text += f"✅ **Question {i+1}: Correct!**\n"
-        else:
-            feedback_text += f"❌ **Question {i+1}: Incorrect**\n"
-            feedback_text += f"   Correct answer: {q['correct']}\n"
-        
-        feedback_text += f"   💡 {q['explanation']}\n\n"
-    
-    score = (correct_count / len(questions)) * 100
-    feedback_text += f"\n🎯 **Final Score: {correct_count}/{len(questions)} ({score:.0f}%)**\n\n"
-    
-    if score >= 80:
-        feedback_text += "Excellent work! You've got a solid understanding! 🎉"
-    elif score >= 60:
-        feedback_text += "Good effort! Review the explanations above and you'll master this! 💪"
-    else:
-        feedback_text += "Keep learning! The explanations above will help clarify these concepts. 📚"
-    
-    return {
-        "feedback": feedback_text,
-        "messages": [AIMessage(content=feedback_text)],
-        "next_action": "ask_continue"
-    }
-
-
-def ask_continue(state: OnboardingState) -> OnboardingState:
-    """Node 7: Ask if user wants to continue learning"""
-    print("\n--- ASK CONTINUE ---")
-    
-    continue_text = "\n\nWould you like to:\n"
-    continue_text += "- Learn about another topic? (just tell me what!)\n"
-    continue_text += "- Connect with team members?\n"
-    continue_text += "- End the onboarding session?\n"
-    
-    return {
-        "messages": [AIMessage(content=continue_text)],
-        "next_action": "route_continue"
-    }
-
-
-# ============================================================================
-# ROUTING FUNCTIONS
-# ============================================================================
-
-def route_from_collect(state: OnboardingState) -> Literal["collect_info", "present_summary"]:
-    """Route after collecting info"""
-    next_action = state.get("next_action", "collect_info")
-    if next_action == "present_summary":
-        return "present_summary"
-    return "collect_info"
-
-
-def route_from_summary(state: OnboardingState) -> Literal["search_materials"]:
-    """Always go to search after summary"""
-    return "search_materials"
-
-
-def route_from_search(state: OnboardingState) -> Literal["ask_quiz", "ask_continue"]:
-    """Route based on whether material was found"""
-    next_action = state.get("next_action", "ask_continue")
-    if next_action == "ask_quiz":
-        return "ask_quiz"
-    return "ask_continue"
-
-
-def route_from_quiz_ask(state: OnboardingState) -> Literal["present_quiz", "ask_continue"]:
-    """Check if user wants quiz"""
-    user_input = state.get("user_input", "").lower()
-    
-    # Simple yes/no detection
-    if any(word in user_input for word in ["yes", "sure", "ok", "yeah", "yep"]):
-        return "present_quiz"
-    return "ask_continue"
-
-
-def route_from_continue(state: OnboardingState) -> Literal["search_materials", "end"]:
-    """Check if user wants to continue or end"""
-    user_input = state.get("user_input", "").lower()
-    
-    # Check for end signals
-    if any(word in user_input for word in ["end", "finish", "done", "exit", "quit", "bye"]):
-        return "end"
-    
-    # Otherwise continue learning
-    return "search_materials"
-
-
-# ============================================================================
-# GRAPH CONSTRUCTION
-# ============================================================================
+def should_continue(state: OnboardingState) -> Literal["tools", "end"]:
+    """Route to tools or end"""
+    last_message = state["messages"][-1]
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        return "tools"
+    return "end"
 
 def create_onboarding_graph():
-    """Build the complete LangGraph workflow"""
-    
+    """Build the agent graph"""
     workflow = StateGraph(OnboardingState)
     
-    # Add all nodes
-    workflow.add_node("collect_info", collect_domain_role)
-    workflow.add_node("present_summary", present_summary)
-    workflow.add_node("search_materials", search_materials)
-    workflow.add_node("ask_quiz", ask_quiz)
-    workflow.add_node("present_quiz", present_quiz)
-    workflow.add_node("evaluate_quiz", evaluate_quiz)
-    workflow.add_node("ask_continue", ask_continue)
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", tool_node)
     
-    # Set entry point
-    workflow.set_entry_point("collect_info")
-    
-    # Add conditional edges
-    workflow.add_conditional_edges(
-        "collect_info",
-        route_from_collect,
-        {
-            "collect_info": "collect_info",
-            "present_summary": "present_summary"
-        }
-    )
+    workflow.set_entry_point("agent")
     
     workflow.add_conditional_edges(
-        "present_summary",
-        route_from_summary,
-        {"search_materials": "search_materials"}
+        "agent",
+        should_continue,
+        {"tools": "tools", "end": END}
     )
     
-    workflow.add_conditional_edges(
-        "search_materials",
-        route_from_search,
-        {
-            "ask_quiz": "ask_quiz",
-            "ask_continue": "ask_continue"
-        }
-    )
+    workflow.add_edge("tools", "agent")
     
-    workflow.add_conditional_edges(
-        "ask_quiz",
-        route_from_quiz_ask,
-        {
-            "present_quiz": "present_quiz",
-            "ask_continue": "ask_continue"
-        }
-    )
-    
-    workflow.add_edge("present_quiz", "evaluate_quiz")
-    workflow.add_edge("evaluate_quiz", "ask_continue")
-    
-    workflow.add_conditional_edges(
-        "ask_continue",
-        route_from_continue,
-        {
-            "search_materials": "search_materials",
-            "end": END
-        }
-    )
-    
-    # Compile with configuration
-    return workflow.compile(
-        checkpointer=None,
-        interrupt_before=None,
-        interrupt_after=None,
-        debug=False
-    )
+    memory = MemorySaver()
+    return workflow.compile(checkpointer=memory)
 
+# ==============================
+# 6. Interactive Interface
+# ==============================
 
-# ============================================================================
-# MAIN EXECUTION - SIMPLE CHAT LOOP
-# ============================================================================
+def display_banner():
+    """Display welcome banner"""
+    print("\n" + "="*70)
+    print("🎓  WELCOME TO ERPNEXT TEAM ONBOARDING")
+    print("     Your Interactive Learning Companion")
+    print("="*70)
+    print("\n💡 I'm here to help you get started with ERPNext!")
+    print("📚 I'll guide you through learning materials")
+    print("🎯 Create personalized learning paths")
+    print("✅ Quiz you to reinforce learning")
+    print("👥 Connect you with team members")
+    print("\nType 'help' anytime for guidance, 'exit' to end session")
+    print("="*70 + "\n")
 
-def run_onboarding_chat():
-    """Run the onboarding agent as an interactive chat"""
+def run_interactive_onboarding():
+    """Run the interactive onboarding agent"""
+    display_banner()
     
-    print("=" * 60)
-    print("🚀 WELCOME TO PROJECT ONBOARDING AGENT")
-    print("=" * 60)
-    print("\nI'll help you get started with our project!")
-    print("Type 'exit' anytime to quit.\n")
+    # Initialize knowledge base
+    initialize_knowledge_base()
     
-    # Create graph
+    # Create agent
     app = create_onboarding_graph()
     
-    # Initialize state
+    # System prompt
+    system_prompt = """You are Jamie, a friendly and enthusiastic ERPNext onboarding coach! 🎓
+
+Your personality:
+- Warm, encouraging, and supportive
+- Use emojis to keep things friendly (but not too many!)
+- Celebrate small wins
+- Patient and thorough
+- Make learning fun and interactive
+
+Your process:
+1. **Get to know them**: Ask their name warmly
+2. **Understand background**: Ask about their interests and experience (don't list options, just ask naturally)
+3. **Match them**: Use tools to match them to module and role
+4. **Create plan**: Use create_onboarding_plan with their name
+5. **Guide learning**: 
+   - Use create_learning_guide for each topic
+   - Check understanding frequently
+   - Offer quiz after 2-3 topics
+6. **Keep them engaged**:
+   - Ask if they have questions
+   - Suggest next topics with suggest_next_topic
+   - Offer to connect them with team using find_team_help
+7. **Track progress**: Use save_progress periodically
+
+Important:
+- Always use their name when you know it
+- Be conversational, not robotic
+- Ask open-ended questions, not multiple choice
+- Celebrate their progress
+- If they seem stuck, offer help proactively
+- Keep responses concise unless explaining complex topics
+
+Commands you recognize:
+- "quiz me" → Generate quiz
+- "what's next" → Suggest next topic
+- "need help" → Connect with team
+- "save progress" → Save their learning state
+
+Start by warmly greeting them and asking their name!"""
+
+    # Initial state
+    config = {"configurable": {"thread_id": f"onboarding-{datetime.now().strftime('%Y%m%d-%H%M%S')}"}}
+    
     state = {
-        "messages": [],
-        "domain": None,
-        "role": None,
-        "learning_topic": None,
-        "project_summary": None,
-        "learning_materials": [],
-        "quiz_ready": False,
-        "quiz_questions": [],
-        "quiz_answers": [],
-        "feedback": None,
-        "team_contact": None,
-        "next_action": "collect_info",
-        "user_input": ""
+        "messages": [
+            SystemMessage(content=system_prompt),
+            AIMessage(content="Hi there! 👋 Welcome to the ERPNext team! I'm Jamie, and I'm so excited to be your onboarding coach.\n\nBefore we dive in, what's your name?")
+        ],
+        "user_name": "",
+        "module": "",
+        "role": "",
+        "completed_topics": [],
+        "current_topic": "",
+        "stage": "welcome",
+        "quiz_data": "",
+        "score": 0
     }
     
-    # Start with initial greeting message
-    print("🤖 Agent: Hello! I'm here to help you get onboarded to our project. Let me know what domain you'll be working in (backend, frontend, or data) and your role (e.g., junior developer, senior engineer, lead).\n")
+    print("Jamie: " + state["messages"][-1].content)
+    print("\n" + "-"*70 + "\n")
     
-    # Chat loop
+    # Main loop
     while True:
-        # Get user input
-        user_input = input("👤 You: ").strip()
-        
-        if user_input.lower() in ['exit', 'quit', 'bye']:
-            print("\n👋 Thanks for onboarding! Good luck with the project!\n")
-            break
-        
-        if not user_input:
-            continue
-        
-        # Update state with user input
-        state["user_input"] = user_input
-        state["messages"].append(HumanMessage(content=user_input))
-        
-        # Run graph
         try:
-            result = app.invoke(state, config={"recursion_limit": 50})
+            # Get user input
+            user_input = input("You: ").strip()
             
-            # Update state for next iteration
+            # Handle special commands
+            if user_input.lower() in ['exit', 'quit', 'bye', 'goodbye']:
+                print("\nJamie: It's been wonderful working with you! 🌟")
+                print("Remember, you can always come back to continue learning.")
+                print("Good luck on your ERPNext journey! 👋\n")
+                break
+            
+            if user_input.lower() == 'help':
+                print("\nJamie: Here's how I can help you:")
+                print("  📚 Learn about topics - just ask!")
+                print("  🎯 'quiz me' - test your knowledge")
+                print("  🔜 'what's next' - see what to learn next")
+                print("  👥 'need help' - connect with team members")
+                print("  💾 'save progress' - save your learning state")
+                print("  🚪 'exit' - end the session\n")
+                continue
+            
+            if not user_input:
+                continue
+            
+            # Add user message
+            state["messages"].append(HumanMessage(content=user_input))
+            
+            # Run agent
+            result = app.invoke(state, config)
             state = result
             
-            # Print agent response
-            if result["messages"]:
-                last_message = result["messages"][-1]
-                if isinstance(last_message, AIMessage):
-                    print(f"\n🤖 Agent: {last_message.content}\n")
-        
+            # Display agent response
+            last_message = state["messages"][-1]
+            if hasattr(last_message, 'content') and last_message.content:
+                print(f"\nJamie: {last_message.content}")
+                print("\n" + "-"*70 + "\n")
+            
+        except KeyboardInterrupt:
+            print("\n\nJamie: Taking a break? No problem! Your progress is saved.")
+            print("Come back anytime to continue! 👋\n")
+            break
         except Exception as e:
-            print(f"\n❌ Error: {e}\n")
-            print("Let's try again!\n")
+            print(f"\nJamie: Oops! I encountered an issue: {e}")
+            print("Let's try that again! 😊\n")
 
+# ==============================
+# 7. Main Entry Point
+# ==============================
 
 if __name__ == "__main__":
-
-    run_onboarding_chat()
+    run_interactive_onboarding()
