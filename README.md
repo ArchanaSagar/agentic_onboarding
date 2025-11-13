@@ -14,13 +14,9 @@ poetry install
 
 ### Configure Environment
 
-Copy `.env.example` to `.env` and fill in your Azure OpenAI credentials:
+The `.env` file is included in the repository with Azure OpenAI credentials.
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your Azure OpenAI details:
+Make sure it contains:
 
 - `OPENAI_AZURE_ENDPOINT`
 - `OPENAI_API_KEY`
@@ -36,7 +32,7 @@ poetry run python chat_agent.py
 ## Project Structure
 
 - `chat_agent.py` - Main onboarding agent with LangGraph workflow
-- `.env` - Environment configuration (not in git)
+- `.env` - Environment configuration (committed to repo)
 - `pyproject.toml` - Poetry dependencies and project metadata
 - `poetry.lock` - Locked dependency versions for reproducible installs
 
