@@ -7,11 +7,13 @@ from langchain_community.document_loaders import WebBaseLoader
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 import json
+from bs4 import BeautifulSoup
+from langchain_core.documents import Document
 
 # ==============================
 # 0. Load Environment Variables
@@ -43,32 +45,97 @@ vectorstore_docs = None
 vectorstore_code = None
 
 
+BASE_URL = "https://docs.frappe.io/erpnext"
+
+def get_all_links(base_url):
+    """Crawl all internal links under the ERPNext docs site."""
+    print("🔍 Crawling ERPNext documentation pages...")
+    visited = set()
+    to_visit = {base_url}
+    all_links = set()
+
+    while to_visit:
+        url = to_visit.pop()
+        if url in visited or not url.startswith(base_url):
+            continue
+
+        visited.add(url)
+        try:
+            res = requests.get(url, timeout=10, verify=False)
+            if res.status_code != 200:
+                continue
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            # Collect internal links
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("/"):
+                    href = base_url.rstrip("/") + href
+                if href.startswith(base_url) and href not in visited:
+                    to_visit.add(href)
+                    all_links.add(href)
+        except Exception as e:
+            print(f"⚠️ Failed to load {url}: {e}")
+
+    print(f"✅ Found {len(all_links)} pages!")
+    return list(all_links)
+
 def initialize_vectorstores():
     """Initialize vector stores for docs and code"""
     global vectorstore_docs, vectorstore_code
+    VECTORSTORE_PATH = "erpnext_vectorstore"
+
+    # ✅ Step 1: Load from existing FAISS vectorstore if available
+    if os.path.exists(VECTORSTORE_PATH):
+        try:
+            print("💾 Loading cached vectorstore from disk...")
+            vectorstore_docs = FAISS.load_local(VECTORSTORE_PATH, embeddings, allow_dangerous_deserialization=True)
+            vectorstore_code = vectorstore_docs
+            print("✅ Vectorstore loaded successfully from cache!")
+            return
+        except Exception as e:
+            print(f"⚠️  Failed to load cached vectorstore: {e}")
+            print("Rebuilding from source...")
+
+    # ✅ Step 2: Otherwise, rebuild it from ERPNext documentation
     
     print("🔄 Loading ERPNext documentation...")
     try:
-        loader_docs = WebBaseLoader(web_path="https://docs.frappe.io/erpnext")
-        docs = loader_docs.load()
-        
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000, 
-            chunk_overlap=100
-        )
-        split_docs = text_splitter.split_documents(docs)
-        
+        all_links = get_all_links(BASE_URL)
+        all_docs = []
+        for link in all_links:
+           
+            try:
+                loader = WebBaseLoader(link,verify_ssl = False,trust_env= True)
+                docs = loader.load()
+                all_docs.extend(docs)
+                print(f"📄 Loaded: {link}")
+            except Exception as e:
+                print(f"⚠️ Skipping {link}: {e}")
+
+        print(f"✅ Loaded {len(all_docs)} documents.")
+
+        # Split text into manageable chunks
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        split_docs = splitter.split_documents(all_docs)
+
+        # Create FAISS vectorstore
         vectorstore_docs = FAISS.from_documents(split_docs, embeddings)
-        vectorstore_code = vectorstore_docs  # Placeholder for code
-        print("✅ Vectorstores initialized!")
+        vectorstore_code = vectorstore_docs
+        print("✅ Vectorstore created successfully!")
+
+        # Optional: save to disk
+        vectorstore_docs.save_local("erpnext_vectorstore")
+        print("💾 Saved vectorstore to 'erpnext_vectorstore'")
     except Exception as e:
         print(f"⚠️  Warning: Could not load documentation: {e}")
         print("Creating minimal fallback vectorstore...")
-        from langchain_core.documents import Document
         fallback_docs = [
             Document(page_content="ERPNext is an open-source ERP system with modules for Accounting, HR, Manufacturing, Sales, Purchase, Projects, and Healthcare.", metadata={}),
             Document(page_content="Common roles in ERPNext include Developer, Tester, Business Analyst, Solution Architect, and System Administrator.", metadata={})
         ]
+        vectorstore_docs = FAISS.from_documents(fallback_docs, embeddings)
+        vectorstore_code = vectorstore_docs
         vectorstore_docs = FAISS.from_documents(fallback_docs, embeddings)
         vectorstore_code = vectorstore_docs
 
