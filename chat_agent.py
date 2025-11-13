@@ -6,7 +6,7 @@ Follows the defined user journey with proper state management
 from typing import TypedDict, Annotated, List, Optional, Literal
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
@@ -143,11 +143,13 @@ PROJECT_DATA = {
 # ============================================================================
 
 def get_llm(temperature=0.7):
-    """Initialize LLM with configuration"""
-    return ChatOpenAI(
-        model="gpt-4o",
-        temperature=temperature,
-        openai_api_key=os.getenv("OPENAI_API_KEY")
+    """Initialize LLM with Azure OpenAI configuration"""
+    return AzureChatOpenAI(
+        azure_endpoint=os.getenv("OPENAI_AZURE_ENDPOINT"),
+        api_key=os.getenv("OPENAI_API_KEY"),
+        api_version=os.getenv("OPENAI_API_VERSION"),
+        model_name=os.getenv("OPENAI_MODEL_NAME"),
+        temperature=temperature
     )
 
 
@@ -246,14 +248,89 @@ def collect_domain_role(state: OnboardingState) -> OnboardingState:
     """Node 1: Collect domain and role from user"""
     print("\n--- COLLECT DOMAIN & ROLE ---")
     
-    llm = get_llm(temperature=0.7)
-    chain = COLLECT_INFO_PROMPT | llm | StrOutputParser()
-    
-    # Check if we already have both
+    # Check if we already have both - if yes, skip to summary
     if state.get("domain") and state.get("role"):
+        print(f"Already have domain: {state.get('domain')}, role: {state.get('role')}")
         return {"next_action": "present_summary"}
     
     user_input = state.get("user_input", "")
+    
+    # Skip LLM call if user_input is empty (first run)
+    if not user_input or user_input == "Hello":
+        return {
+            "messages": [AIMessage(content="Hello! What domain will you be working in (backend, frontend, or data) and what's your role?")],
+            "next_action": "collect_info"
+        }
+    
+    # Try to extract domain and role from user input (flexible keyword matching)
+    domain_keywords = {"backend", "frontend", "front-end", "front end", "data", "data science"}
+    role_keywords = {
+        "junior", "senior", "lead", "developer", "engineer", "dev", 
+        "architect", "manager", "intern", "principal"
+    }
+    
+    user_lower = user_input.lower()
+    extracted_domain = state.get("domain")  # Keep existing if already set
+    extracted_role = state.get("role")  # Keep existing if already set
+    
+    # Extract domain if not already set
+    if not extracted_domain:
+        for domain in domain_keywords:
+            if domain in user_lower:
+                # Normalize domain names
+                if "front" in domain:
+                    extracted_domain = "frontend"
+                elif "data" in domain:
+                    extracted_domain = "data"
+                else:
+                    extracted_domain = domain
+                break
+    
+    # Extract role if not already set - look for any role keyword
+    if not extracted_role:
+        for role in role_keywords:
+            if role in user_lower:
+                extracted_role = role
+                break
+    
+    print(f"Extracted - Domain: {extracted_domain}, Role: {extracted_role}")
+    
+    # If we couldn't extract either, provide options
+    if not extracted_domain or not extracted_role:
+        missing_info = []
+        if not extracted_domain:
+            missing_info.append("domain")
+        if not extracted_role:
+            missing_info.append("role")
+        
+        response = f"I couldn't identify your {' and '.join(missing_info)}. Let me help!\n\n"
+        
+        if not extracted_domain:
+            response += "**Available Domains:**\n"
+            response += "1. Backend - Server-side development, APIs, databases\n"
+            response += "2. Frontend - User interfaces, web applications\n"
+            response += "3. Data - Data science, ML, analytics\n\n"
+        
+        if not extracted_role:
+            response += "**Common Roles:**\n"
+            response += "- Junior Developer/Engineer\n"
+            response += "- Senior Developer/Engineer\n"
+            response += "- Lead/Team Lead\n"
+            response += "- Architect\n"
+            response += "- Manager\n\n"
+        
+        response += "Please tell me your domain and role (e.g., 'backend senior developer' or 'frontend lead')."
+        
+        return {
+            "messages": [AIMessage(content=response)],
+            "domain": extracted_domain,
+            "role": extracted_role,
+            "next_action": "collect_info"
+        }
+    
+    # Use LLM for friendly response when we have the info
+    llm = get_llm(temperature=0.7)
+    chain = COLLECT_INFO_PROMPT | llm | StrOutputParser()
     history = state.get("messages", [])
     
     response = chain.invoke({
@@ -261,40 +338,19 @@ def collect_domain_role(state: OnboardingState) -> OnboardingState:
         "input": user_input
     })
     
-    # Try to extract domain and role from user input (simple keyword matching)
-    domain_keywords = {"backend", "frontend", "data"}
-    role_keywords = {"junior", "senior", "lead", "developer", "engineer"}
-    
-    user_lower = user_input.lower()
-    extracted_domain = None
-    extracted_role = None
-    
-    for domain in domain_keywords:
-        if domain in user_lower:
-            extracted_domain = domain
-            break
-    
-    for role in role_keywords:
-        if role in user_lower:
-            extracted_role = user_lower if role in user_lower else None
-            break
-    
+    # Build updates
     updates = {
         "messages": [AIMessage(content=response)],
+        "domain": extracted_domain,
+        "role": extracted_role
     }
     
-    if extracted_domain and not state.get("domain"):
-        updates["domain"] = extracted_domain
-    if extracted_role and not state.get("role"):
-        updates["role"] = extracted_role
-    
-    # Decide next action
-    if state.get("domain") or extracted_domain:
-        if state.get("role") or extracted_role:
-            updates["next_action"] = "present_summary"
-        else:
-            updates["next_action"] = "collect_info"
+    # Decide next action based on what we have
+    if extracted_domain and extracted_role:
+        print("Both found! Moving to present_summary")
+        updates["next_action"] = "present_summary"
     else:
+        print(f"Missing - Domain: {not extracted_domain}, Role: {not extracted_role}")
         updates["next_action"] = "collect_info"
     
     return updates
@@ -669,7 +725,13 @@ def create_onboarding_graph():
         }
     )
     
-    return workflow.compile()
+    # Compile with configuration
+    return workflow.compile(
+        checkpointer=None,
+        interrupt_before=None,
+        interrupt_after=None,
+        debug=False
+    )
 
 
 # ============================================================================
@@ -705,13 +767,8 @@ def run_onboarding_chat():
         "user_input": ""
     }
     
-    # Initial greeting
-    state["user_input"] = "Hello"
-    result = app.invoke(state)
-    
-    # Print initial message
-    if result["messages"]:
-        print(f"\n🤖 Agent: {result['messages'][-1].content}\n")
+    # Start with initial greeting message
+    print("🤖 Agent: Hello! I'm here to help you get onboarded to our project. Let me know what domain you'll be working in (backend, frontend, or data) and your role (e.g., junior developer, senior engineer, lead).\n")
     
     # Chat loop
     while True:
@@ -726,12 +783,15 @@ def run_onboarding_chat():
             continue
         
         # Update state with user input
-        result["user_input"] = user_input
-        result["messages"].append(HumanMessage(content=user_input))
+        state["user_input"] = user_input
+        state["messages"].append(HumanMessage(content=user_input))
         
         # Run graph
         try:
-            result = app.invoke(result)
+            result = app.invoke(state, config={"recursion_limit": 50})
+            
+            # Update state for next iteration
+            state = result
             
             # Print agent response
             if result["messages"]:
@@ -745,7 +805,10 @@ def run_onboarding_chat():
 
 
 if __name__ == "__main__":
-    # Make sure to set your OpenAI API key
-    # export OPENAI_API_KEY='your-key-here'
+    # Make sure to set your Azure OpenAI credentials in .env file
+    # OPENAI_AZURE_ENDPOINT=https://your-resource.openai.azure.com/
+    # OPENAI_API_KEY=your-key-here
+    # OPENAI_API_VERSION=2024-02-15-preview
+    # OPENAI_MODEL_NAME=gpt-4
     
     run_onboarding_chat()
