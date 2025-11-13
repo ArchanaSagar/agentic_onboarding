@@ -805,10 +805,5 @@ def run_onboarding_chat():
 
 
 if __name__ == "__main__":
-    # Make sure to set your Azure OpenAI credentials in .env file
-    # OPENAI_AZURE_ENDPOINT=https://your-resource.openai.azure.com/
-    # OPENAI_API_KEY=your-key-here
-    # OPENAI_API_VERSION=2024-02-15-preview
-    # OPENAI_MODEL_NAME=gpt-4
-    
+
     run_onboarding_chat()
