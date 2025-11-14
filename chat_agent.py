@@ -200,39 +200,102 @@ def get_github_contributors(keyword: str, repo: str = "frappe/erpnext") -> dict:
 
 def search_github_code(keyword: str, repo: str = "frappe/erpnext"):
     """Search GitHub code repository for specific keywords - returns structured data."""
-    url = f"https://api.github.com/search/code?q={keyword}+repo:{repo}&per_page=10"
-    headers = {"Accept": "application/vnd.github+json"}
     
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    # Check if token exists
+    if not GITHUB_TOKEN:
+        return {
+            "error": "GitHub Code Search requires authentication. Please add GITHUB_TOKEN to your .env file.",
+            "files": [],
+            "help": "Get a token from: https://github.com/settings/tokens (needs 'public_repo' scope)"
+        }
+    
+    url = f"https://api.github.com/search/code?q={keyword}+repo:{repo}&per_page=10"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"token {GITHUB_TOKEN}"
+    }
     
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
+        
+        if response.status_code == 401:
             return {
-                "error": f"GitHub API returned status {response.status_code}. Consider adding GITHUB_TOKEN to .env for higher rate limits"
+                "error": "GitHub authentication failed. Check your GITHUB_TOKEN in .env file.",
+                "files": []
+            }
+        elif response.status_code == 403:
+            return {
+                "error": "GitHub API rate limit exceeded. Wait a few minutes or check your token.",
+                "files": []
+            }
+        elif response.status_code != 200:
+            return {
+                "error": f"GitHub API returned status {response.status_code}",
+                "files": []
             }
         
         data = response.json()
         items = data.get("items", [])
         
         if not items:
-            return {"error": f"No code found for: {keyword}", "files": []}
+            # Use general repository search as fallback
+            return search_github_files_fallback(keyword, repo)
         
         # Return structured data
         files = []
         for item in items:
             files.append({
-                "name": item['name'],
-                "path": item['path'],
-                "url": item['html_url'],
-                "repository": item['repository']['full_name']
+                "name": item.get('name', 'unknown'),
+                "path": item.get('path', ''),
+                "url": item.get('html_url', ''),
+                "repository": item.get('repository', {}).get('full_name', repo)
             })
         
         return {"files": files, "total": len(files), "keyword": keyword}
         
     except Exception as e:
         return {"error": f"Could not search code: {str(e)}", "files": []}
+
+def search_github_files_fallback(keyword: str, repo: str = "frappe/erpnext"):
+    """Fallback method using repository contents search when code search fails."""
+    try:
+        # Search using repository tree API - doesn't require special permissions
+        url = f"https://api.github.com/repos/{repo}/git/trees/develop?recursive=1"
+        headers = {"Accept": "application/vnd.github+json"}
+        if GITHUB_TOKEN:
+            headers["Authorization"] = f"token {GITHUB_TOKEN}"
+        
+        response = requests.get(url, headers=headers, timeout=15)
+        
+        if response.status_code != 200:
+            return {"error": f"No code found for: {keyword}", "files": []}
+        
+        data = response.json()
+        tree = data.get('tree', [])
+        
+        # Filter files by keyword in path/name
+        matching_files = []
+        keyword_lower = keyword.lower()
+        
+        for item in tree:
+            if item.get('type') == 'blob':  # Only files, not directories
+                path = item.get('path', '')
+                if keyword_lower in path.lower():
+                    matching_files.append({
+                        "name": path.split('/')[-1],
+                        "path": path,
+                        "url": f"https://github.com/{repo}/blob/develop/{path}",
+                        "repository": repo
+                    })
+        
+        if matching_files:
+            # Limit to top 10
+            return {"files": matching_files[:10], "total": len(matching_files), "keyword": keyword}
+        else:
+            return {"error": f"No files found matching: {keyword}", "files": []}
+            
+    except Exception as e:
+        return {"error": f"Fallback search failed: {str(e)}", "files": []}
 
 def fetch_file_content(file_url: str) -> str:
     """Fetch file content from GitHub URL."""
@@ -654,16 +717,18 @@ Be concise and role-specific."""
                                     'url': file['url'],
                                     'lines': relevant_lines[:5]
                                 })
-                    except:
+                    except Exception as ex:
+                        print(f"   ⚠️ Could not fetch {file['name']}: {ex}")
                         pass
                 
-                # Generate high-level analysis with code context
-                code_context = "\n\n".join([
-                    f"File: {s['file']}\nCode:\n" + "\n".join(s['lines'])
-                    for s in code_snippets[:3]
-                ])
-                
-                prompt = f"""You are an ERPNext expert analyzing code for a {inputs['role']} in the {inputs['domain']} domain.
+                if code_snippets:
+                    # Generate high-level analysis with code context
+                    code_context = "\n\n".join([
+                        f"File: {s['file']}\nCode:\n" + "\n".join(s['lines'])
+                        for s in code_snippets[:3]
+                    ])
+                    
+                    prompt = f"""You are an ERPNext expert analyzing code for a {inputs['role']} in the {inputs['domain']} domain.
 
 The user searched for topic: {keyword}
 
@@ -680,22 +745,55 @@ Provide HIGH-LEVEL INFORMATION:
 6. **Usage guidance**: How a {inputs['role']} might work with or extend this
 
 Be practical and help them understand the big picture without diving too deep into code details."""
-                
-                try:
-                    response = llm.invoke(prompt)
-                    code_result = response.content if hasattr(response, 'content') else str(response)
                     
-                    # Add file references
-                    code_result += "\n\n**📂 Related Files:**\n"
-                    for i, file in enumerate(files[:5], 1):
-                        code_result += f"{i}. {file['path']}\n   🔗 {file['url']}\n"
+                    try:
+                        response = llm.invoke(prompt)
+                        code_result = response.content if hasattr(response, 'content') else str(response)
                         
-                except Exception as e:
-                    code_result = f"Error analyzing code: {e}"
+                        # Add file references
+                        code_result += "\n\n**📂 Related Files:**\n"
+                        for i, file in enumerate(files[:5], 1):
+                            code_result += f"{i}. {file['path']}\n   🔗 {file['url']}\n"
+                            
+                    except Exception as e:
+                        code_result = f"Error analyzing code: {e}"
+                else:
+                    # No code snippets fetched, just list files
+                    code_result = f"**📂 Found {len(files)} related files:**\n\n"
+                    for i, file in enumerate(files[:10], 1):
+                        code_result += f"{i}. {file['path']}\n   🔗 {file['url']}\n"
             else:
                 code_result = "No code files found in GitHub repository."
         else:
-            code_result = f"Error searching GitHub: {code_data.get('error', 'Unknown error')}"
+            # Display helpful error message
+            error_msg = code_data.get('error', 'Unknown error')
+            code_result = f"⚠️ GitHub Search Error: {error_msg}"
+            
+            if 'help' in code_data:
+                code_result += f"\n\n💡 Help: {code_data['help']}"
+            
+            # Try to provide alternative guidance using LLM
+            print(f"\n   ⚠️ {error_msg}")
+            if 'authentication' in error_msg.lower() or 'token' in error_msg.lower():
+                print(f"   💡 To enable GitHub code search, add GITHUB_TOKEN to your .env file")
+                print(f"   📖 Get token from: https://github.com/settings/tokens")
+                
+            # Generate guidance without code
+            try:
+                fallback_prompt = f"""A {inputs['role']} in {inputs['domain']} domain wants to learn about "{keyword}" in ERPNext, but code search is unavailable.
+
+Based on your ERPNext knowledge, provide:
+1. What this topic likely involves
+2. Where in ERPNext this would typically be found
+3. Key concepts to understand
+4. Recommended resources or documentation to explore
+
+Be helpful and practical."""
+                
+                response = llm.invoke(fallback_prompt)
+                code_result = response.content if hasattr(response, 'content') else code_result
+            except:
+                pass
     else:
         # Documentation was found, still check code for additional context
         print("   🔍 Checking GitHub for code references...")
