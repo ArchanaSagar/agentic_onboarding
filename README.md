@@ -1,4 +1,4 @@
-# Agentic Onboarding
+# Onboarding Agent
 
 AI-powered project onboarding agent using LangGraph and LangChain.
 
