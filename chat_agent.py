@@ -128,11 +128,9 @@ def initialize_vectorstores():
                 
         except Exception as e:
             print(f"⚠️ Creating fallback vectorstore: {e}")
-            fallback_docs = [
-                Document(page_content="ERPNext is an open-source ERP system with modules for Accounting, HR, Manufacturing, Sales, Purchase, Projects, and Healthcare.", metadata={}),
-                Document(page_content="Common roles in ERPNext include Developer, Tester, Business Analyst, Solution Architect, and System Administrator.", metadata={})
-            ]
-            vectorstore_docs = FAISS.from_documents(fallback_docs, embeddings)
+            # Generate fallback content using LLM
+            fallback_content = generate_fallback_content()
+            vectorstore_docs = FAISS.from_documents(fallback_content, embeddings)
             vectorstore_code = vectorstore_docs
 
     # Create retrievers
@@ -200,9 +198,9 @@ def get_github_contributors(keyword: str, repo: str = "frappe/erpnext") -> dict:
     except Exception as e:
         return {"error": f"Could not fetch contributors: {str(e)}"}
 
-def search_github_code(keyword: str, repo: str = "frappe/erpnext") -> str:
-    """Search GitHub code repository for specific keywords."""
-    url = f"https://api.github.com/search/code?q={keyword}+repo:{repo}&per_page=5"
+def search_github_code(keyword: str, repo: str = "frappe/erpnext"):
+    """Search GitHub code repository for specific keywords - returns structured data."""
+    url = f"https://api.github.com/search/code?q={keyword}+repo:{repo}&per_page=10"
     headers = {"Accept": "application/vnd.github+json"}
     
     if GITHUB_TOKEN:
@@ -211,22 +209,108 @@ def search_github_code(keyword: str, repo: str = "frappe/erpnext") -> str:
     try:
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
-            return f"GitHub API returned status {response.status_code}. (Consider adding GITHUB_TOKEN to .env for higher rate limits)"
+            return {
+                "error": f"GitHub API returned status {response.status_code}. Consider adding GITHUB_TOKEN to .env for higher rate limits"
+            }
         
         data = response.json()
         items = data.get("items", [])
         
         if not items:
-            return f"No code found for: {keyword}"
+            return {"error": f"No code found for: {keyword}", "files": []}
         
-        result = [f"Code files containing '{keyword}':\n"]
-        for i, item in enumerate(items[:5], 1):
-            result.append(f"{i}. {item['name']} (in {item['path']})")
-            result.append(f"   {item['html_url']}\n")
+        # Return structured data
+        files = []
+        for item in items:
+            files.append({
+                "name": item['name'],
+                "path": item['path'],
+                "url": item['html_url'],
+                "repository": item['repository']['full_name']
+            })
         
-        return "\n".join(result)
+        return {"files": files, "total": len(files), "keyword": keyword}
+        
     except Exception as e:
-        return f"Could not search code: {str(e)}"
+        return {"error": f"Could not search code: {str(e)}", "files": []}
+
+def fetch_file_content(file_url: str) -> str:
+    """Fetch file content from GitHub URL."""
+    try:
+        # Convert web URL to raw content URL
+        raw_url = file_url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+        headers = {}
+        if GITHUB_TOKEN:
+            headers['Authorization'] = f'token {GITHUB_TOKEN}'
+        
+        response = requests.get(raw_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return response.text[:5000]  # Limit to first 5000 chars
+        return None
+    except Exception as e:
+        return None
+
+def generate_fallback_content():
+    """Generate fallback vectorstore content using LLM when documentation fails."""
+    try:
+        prompt = """You are an ERPNext expert. Generate comprehensive overview content about ERPNext for documentation purposes.
+
+Provide 10 distinct, informative paragraphs covering:
+1. ERPNext overview and purpose
+2. Main modules (Accounting, HR, Manufacturing, Sales, Purchase, etc.)
+3. Common roles in ERPNext projects
+4. Key features and capabilities
+5. Integration and customization
+6. Workflow and automation
+7. Reporting and analytics
+8. User management and permissions
+9. Implementation best practices
+10. Technical architecture overview
+
+Format each paragraph on a separate line. Make each paragraph substantial (100-150 words)."""
+
+        response = llm.invoke(prompt)
+        content = response.content if hasattr(response, 'content') else str(response)
+        
+        # Split into paragraphs and create documents
+        paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
+        fallback_docs = [Document(page_content=para, metadata={"source": "llm-generated"}) for para in paragraphs if len(para) > 50]
+        
+        if fallback_docs:
+            print(f"   ✓ Generated {len(fallback_docs)} fallback documents using LLM")
+            return fallback_docs
+        
+    except Exception as e:
+        print(f"   ⚠️ LLM fallback generation failed: {e}")
+    
+    # Ultimate fallback - minimal content
+    return [
+        Document(page_content="ERPNext is an open-source ERP system with comprehensive modules.", metadata={"source": "minimal-fallback"}),
+        Document(page_content="Common ERPNext roles include Developer, Tester, and Analyst.", metadata={"source": "minimal-fallback"})
+    ]
+
+def generate_dynamic_list(topic: str, example: str) -> list:
+    """Generate a dynamic list using LLM for any topic."""
+    try:
+        prompt = f"""Generate a comprehensive list of {topic}.
+
+Provide at least 8-10 items as a comma-separated list.
+Example format: {example}
+
+Return ONLY the comma-separated list, no explanations."""
+
+        response = llm.invoke(prompt)
+        text = response.content if hasattr(response, 'content') else str(response)
+        text = text.strip().replace('`', '').replace('*', '')
+        if '\n' in text:
+            text = text.split('\n')[0]
+        
+        items = [item.strip() for item in text.split(",") if item.strip()]
+        return items if items else [example.split(",")[0].strip()]
+        
+    except Exception as e:
+        print(f"   ⚠️ Dynamic list generation failed: {e}")
+        return [item.strip() for item in example.split(",")]
 
 def extract_domains_and_roles():
     """Use LLM to extract domains and roles - roles generated purely from LLM knowledge."""
@@ -311,14 +395,12 @@ Do NOT include any other text, explanations, or preamble."""
     
     # Only use fallback if LLM completely failed
     if not domains:
-        print("   ⚠️ Using fallback domains")
-        domains = ["Accounting", "Sales", "Purchase", "Manufacturing", "HR & Payroll", 
-                   "Projects", "Healthcare", "CRM", "Assets", "Stock/Inventory"]
+        print("   ⚠️ Generating fallback domains using LLM...")
+        domains = generate_dynamic_list("ERPNext modules and domains", "Accounting, Sales, Manufacturing")
     
     if not roles:
-        print("   ⚠️ Using fallback roles")
-        roles = ["Developer", "Tester", "Business Analyst", "Solution Architect", 
-                 "System Administrator", "Functional Consultant", "Project Manager"]
+        print("   ⚠️ Generating fallback roles using LLM...")
+        roles = generate_dynamic_list("Common roles in ERP implementation projects", "Developer, Tester, Business Analyst")
     
     print(f"✅ Final: {len(domains)} domains, {len(roles)} roles\n")
     return domains, roles
@@ -326,6 +408,42 @@ Do NOT include any other text, explanations, or preamble."""
 # ==============================
 # 5. User Interaction Functions
 # ==============================
+def match_user_input(user_input: str, options: list) -> str:
+    """Use LLM to match user input to closest option from list."""
+    # First try exact match
+    if user_input in options:
+        return user_input
+    
+    # Try case-insensitive match
+    for opt in options:
+        if user_input.lower() == opt.lower():
+            return opt
+    
+    # Use LLM for fuzzy matching
+    try:
+        prompt = f"""The user entered: "{user_input}"
+
+Available options:
+{chr(10).join([f"- {opt}" for opt in options])}
+
+Which option does the user most likely mean? Return ONLY the exact option text from the list above, nothing else."""
+
+        response = llm.invoke(prompt)
+        matched = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+        matched = matched.replace('`', '').replace('*', '').replace('-', '').strip()
+        
+        # Verify the match is in options
+        for opt in options:
+            if matched.lower() == opt.lower() or matched in opt or opt in matched:
+                return opt
+        
+        return None
+        
+    except Exception as e:
+        # Fallback to simple substring match
+        matches = [opt for opt in options if user_input.lower() in opt.lower()]
+        return matches[0] if matches else None
+
 def collect_info():
     """Collect user's domain and role."""
     print("\n" + "="*70)
@@ -348,17 +466,13 @@ def collect_info():
             if 0 <= idx < len(domains):
                 domain = domains[idx]
                 break
-        # Try name matching
-        elif domain_input in domains:
-            domain = domain_input
-            break
-        else:
-            # Fuzzy match
-            matches = [d for d in domains if domain_input.lower() in d.lower()]
-            if matches:
-                domain = matches[0]
+        
+        # Use LLM for matching
+        domain = match_user_input(domain_input, domains)
+        if domain:
+            if domain != domain_input:
                 print(f"✓ Matched to: {domain}")
-                break
+            break
         
         print("❌ Invalid selection, please try again.")
 
@@ -376,17 +490,13 @@ def collect_info():
             if 0 <= idx < len(roles):
                 role = roles[idx]
                 break
-        # Try name matching
-        elif role_input in roles:
-            role = role_input
-            break
-        else:
-            # Fuzzy match
-            matches = [r for r in roles if role_input.lower() in r.lower()]
-            if matches:
-                role = matches[0]
+        
+        # Use LLM for matching
+        role = match_user_input(role_input, roles)
+        if role:
+            if role != role_input:
                 print(f"✓ Matched to: {role}")
-                break
+            break
         
         print("❌ Invalid selection, please try again.")
 
@@ -457,55 +567,45 @@ Be specific, practical, and encouraging. Use real ERPNext terminology from the d
         
     except Exception as e:
         print(f"⚠️ Could not generate detailed summary: {e}")
-        
-        # Fallback summary
-        summary = f"""
-🎯 **ROLE OVERVIEW**
-Welcome as a {inputs['role']} in the {inputs['domain']} domain! You'll be working with ERPNext's {inputs['domain']} module.
-
-📋 **KEY RESPONSIBILITIES**
-- Understanding {inputs['domain']} business processes
-- Working with ERPNext {inputs['domain']} features
-- Collaborating with the team on implementations
-- Testing and quality assurance
-
-🚀 **GETTING STARTED**
-1. Explore the ERPNext {inputs['domain']} module documentation
-2. Set up your development environment
-3. Review existing workflows and processes
-4. Connect with senior team members
-
-💡 **NEXT STEPS**
-Start exploring specific features and workflows in the learning section!
-"""
-        print(summary)
-        print("\n" + "="*70)
-    
     return {**inputs, "summary": summary}
 
 def search_materials(inputs):
-    """Search for learning materials based on keyword/feature."""
+    """Search for learning materials based on keyword/topic only - using semantic search."""
     print("\n" + "="*70)
     print("📚 LEARNING MATERIALS")
     print("="*70)
     
-    keyword = input("\n🔍 Enter topic/feature ID/PBI to learn about: ").strip()
+    keyword = input("\n🔍 Enter topic to learn about: ").strip()
     
     if not keyword:
-        print("No keyword provided.")
+        print("No topic provided.")
         return {**inputs, "materials_doc": "", "materials_code": "", "commits": "", "keyword": ""}
     
-    print(f"\n🔎 Searching for '{keyword}'...")
+    print(f"\n🔎 Performing semantic search for '{keyword}'...")
+    print("   📖 Searching documentation with embeddings...")
     
-    # Search documentation
-    try:
-        doc_query = f"{keyword} in {inputs['domain']} for {inputs['role']}"
-        docs = qa_docs.invoke(doc_query)
-        
-        if docs:
-            context = "\n\n".join([doc.page_content[:1000] for doc in docs])
+    # Semantic search in documentation using similarity_search_with_score
+    docs_found = False
+    doc_result = ""
+    
+    if vectorstore_docs:
+        try:
+            # Use semantic similarity search with relevance scores
+            results = vectorstore_docs.similarity_search_with_score(keyword, k=5)
             
-            prompt = f"""Explain '{keyword}' for a {inputs['role']} in {inputs['domain']} domain.
+            if results:
+                # Filter by relevance - FAISS returns distance (lower is better)
+                # Keep results with reasonable distance scores (< 2.0 is usually relevant)
+                relevant_docs = [(doc, score) for doc, score in results if score < 2.0]
+                
+                if relevant_docs:
+                    docs_found = True
+                    print(f"   ✅ Found {len(relevant_docs)} relevant documentation sections\n")
+                    
+                    # Build context from top results
+                    context = "\n\n".join([doc.page_content[:1000] for doc, score in relevant_docs[:3]])
+                    
+                    prompt = f"""Explain '{keyword}' for a {inputs['role']} in {inputs['domain']} domain.
 
 Context from documentation:
 {context}
@@ -513,21 +613,104 @@ Context from documentation:
 Provide:
 1. **What it is**: Brief definition
 2. **How it works**: Technical/functional explanation
-3. **Practical usage**: Real-world application for {inputs['role']}
-4. **Key points**: Important things to remember
+3. **Key points**: Important things to remember
 
 Be concise and role-specific."""
-            
-            response = llm.invoke(prompt)
-            doc_result = response.content if hasattr(response, 'content') else str(response)
-        else:
-            doc_result = "No documentation found in vectorstore."
-    except Exception as e:
-        doc_result = f"Error searching docs: {e}"
+                    
+                    response = llm.invoke(prompt)
+                    doc_result = response.content if hasattr(response, 'content') else str(response)
+                else:
+                    print("   ⚠️ No highly relevant documentation found\n")
+            else:
+                print("   ⚠️ No documentation results\n")
+                
+        except Exception as e:
+            print(f"   ⚠️ Error in semantic search: {e}\n")
+            doc_result = f"Error searching docs: {e}"
     
-    # Search GitHub code
-    print("   🔍 Searching GitHub code repository...")
-    code_result = search_github_code(keyword)
+    # If no documentation found, search in GitHub code
+    code_result = ""
+    if not docs_found:
+        print("   🔍 No documentation found. Searching GitHub codebase...")
+        code_data = search_github_code(keyword)
+        
+        if "error" not in code_data:
+            files = code_data.get("files", [])
+            if files:
+                print(f"   ✅ Found {len(files)} code files\n")
+                
+                # Fetch code snippets from top files
+                code_snippets = []
+                for file in files[:5]:
+                    try:
+                        content = fetch_file_content(file['url'])
+                        if content:
+                            # Extract relevant lines
+                            lines = content.split('\n')
+                            relevant_lines = [line for line in lines if keyword.lower() in line.lower()]
+                            if relevant_lines:
+                                code_snippets.append({
+                                    'file': file['path'],
+                                    'url': file['url'],
+                                    'lines': relevant_lines[:5]
+                                })
+                    except:
+                        pass
+                
+                # Generate high-level analysis with code context
+                code_context = "\n\n".join([
+                    f"File: {s['file']}\nCode:\n" + "\n".join(s['lines'])
+                    for s in code_snippets[:3]
+                ])
+                
+                prompt = f"""You are an ERPNext expert analyzing code for a {inputs['role']} in the {inputs['domain']} domain.
+
+The user searched for topic: {keyword}
+
+No documentation was found. Here are code files and snippets:
+
+{code_context[:3000]}
+
+Provide HIGH-LEVEL INFORMATION:
+1. **What this is**: Based on file names and code, what feature/functionality is this
+2. **Purpose**: What problem does it solve in ERPNext
+3. **Architecture overview**: How it fits into ERPNext (controllers, models, views, etc.)
+4. **Key components**: Main files and their roles
+5. **Code insights**: Notable patterns, functions, or classes found
+6. **Usage guidance**: How a {inputs['role']} might work with or extend this
+
+Be practical and help them understand the big picture without diving too deep into code details."""
+                
+                try:
+                    response = llm.invoke(prompt)
+                    code_result = response.content if hasattr(response, 'content') else str(response)
+                    
+                    # Add file references
+                    code_result += "\n\n**📂 Related Files:**\n"
+                    for i, file in enumerate(files[:5], 1):
+                        code_result += f"{i}. {file['path']}\n   🔗 {file['url']}\n"
+                        
+                except Exception as e:
+                    code_result = f"Error analyzing code: {e}"
+            else:
+                code_result = "No code files found in GitHub repository."
+        else:
+            code_result = f"Error searching GitHub: {code_data.get('error', 'Unknown error')}"
+    else:
+        # Documentation was found, still check code for additional context
+        print("   🔍 Checking GitHub for code references...")
+        code_data = search_github_code(keyword)
+        
+        if "error" not in code_data:
+            files = code_data.get("files", [])
+            if files:
+                code_result = f"\n**📂 Related Code Files ({len(files)} found):**\n\n"
+                for i, file in enumerate(files[:5], 1):
+                    code_result += f"{i}. {file['path']}\n   🔗 {file['url']}\n\n"
+            else:
+                code_result = "No code files found."
+        else:
+            code_result = code_data.get('error', 'Error searching code.')
     
     # Get contributors for this topic
     print("   🔍 Finding team members who worked on this topic...")
@@ -535,14 +718,20 @@ Be concise and role-specific."""
     
     # Display results
     print("\n" + "─"*70)
-    print("📖 DOCUMENTATION:")
-    print("─"*70)
-    print(doc_result)
+    if docs_found:
+        print("📖 DOCUMENTATION INSIGHTS:")
+        print("─"*70)
+        print(doc_result)
+    else:
+        print("💻 CODE ANALYSIS (No documentation found):")
+        print("─"*70)
+        print(code_result if code_result else "No results found")
     
-    print("\n" + "─"*70)
-    print("💻 CODE REFERENCES:")
-    print("─"*70)
-    print(code_result)
+    if docs_found and code_result:
+        print("\n" + "─"*70)
+        print("💻 CODE REFERENCES:")
+        print("─"*70)
+        print(code_result)
     
     print("\n" + "─"*70)
     print("👥 TEAM MEMBERS WHO WORKED ON THIS:")
@@ -580,10 +769,97 @@ Be concise and role-specific."""
     }
 
 def ask_quiz(inputs):
-    """Ask if user wants to take a quiz."""
+    """Ask if user wants to take a quiz - with flexible interpretation."""
     print("\n" + "="*70)
     response = input("❓ Would you like to take a quiz on what you've learned? (yes/no): ").strip().lower()
-    return response in ['yes', 'y']
+    return interpret_yes_no(response)
+
+def parse_quiz_with_llm(quiz_content: str, inputs: dict) -> list:
+    """Use LLM to parse quiz content into structured format."""
+    try:
+        prompt = f"""Parse this quiz content into a structured JSON format.
+
+Quiz content:
+{quiz_content[:3000]}
+
+Extract each question with:
+- question: the question text
+- options: list of 4 options (A, B, C, D with their text)
+- answer: the correct answer letter (A/B/C/D)
+- explanation: explanation of the correct answer
+
+Return ONLY a valid JSON array of question objects, no other text.
+Example: [{{"question": "Q1: ...", "options": ["A) ...", "B) ...", "C) ...", "D) ..."], "answer": "A", "explanation": "..."}}]"""
+
+        response = llm.invoke(prompt)
+        result = response.content if hasattr(response, 'content') else str(response)
+        
+        # Try to parse JSON
+        import json
+        result = result.strip()
+        if result.startswith('```'):
+            result = result.split('```')[1]
+            if result.startswith('json'):
+                result = result[4:]
+        result = result.strip()
+        
+        quiz_data = json.loads(result)
+        return quiz_data if isinstance(quiz_data, list) else []
+        
+    except Exception as e:
+        print(f"   ⚠️ LLM parsing failed, using regex: {e}")
+        # Fallback to original parsing
+        quiz_data = []
+        current_question = {}
+        
+        for line in quiz_content.split('\n'):
+            line = line.strip()
+            if line.startswith('Q') and ':' in line:
+                if current_question:
+                    quiz_data.append(current_question)
+                current_question = {'question': line, 'options': [], 'answer': '', 'explanation': ''}
+            elif line.startswith(('A)', 'B)', 'C)', 'D)')):
+                current_question['options'].append(line)
+            elif line.startswith('ANSWER:'):
+                current_question['answer'] = line.replace('ANSWER:', '').strip()
+            elif line.startswith('EXPLANATION:'):
+                current_question['explanation'] = line.replace('EXPLANATION:', '').strip()
+        
+        if current_question:
+            quiz_data.append(current_question)
+        
+        return quiz_data
+
+def evaluate_quiz_with_llm(correct_count: int, total: int, inputs: dict) -> str:
+    """Generate dynamic quiz feedback using LLM."""
+    try:
+        percentage = (correct_count * 100) // total
+        
+        prompt = f"""A {inputs['role']} in {inputs['domain']} domain just completed a quiz about ERPNext.
+
+Score: {correct_count}/{total} ({percentage}%)
+
+Generate encouraging and personalized feedback in 2-3 sentences. Include:
+- Recognition of their performance
+- Actionable advice based on their score
+- Motivation to continue learning
+
+Keep it warm, professional, and specific to their role and domain."""
+
+        response = llm.invoke(prompt)
+        feedback = response.content if hasattr(response, 'content') else str(response)
+        return feedback.strip()
+        
+    except Exception as e:
+        # Fallback to simple feedback
+        if correct_count == total:
+            return "🌟 Perfect score! Excellent work!"
+        elif correct_count >= total * 0.7:
+            return "👍 Great job! You have a solid understanding."
+        elif correct_count >= total * 0.5:
+            return "📚 Good effort! Review the topics you missed."
+        else:
+            return "💪 Keep learning! Review the materials and try again."
 
 def present_quiz(inputs):
     """Generate and present quiz questions interactively."""
@@ -610,25 +886,8 @@ Make questions practical and relevant to their role. Cover different aspects of 
         response = llm.invoke(prompt)
         quiz_content = response.content if hasattr(response, 'content') else str(response)
         
-        # Parse quiz into questions and answers
-        quiz_data = []
-        current_question = {}
-        
-        for line in quiz_content.split('\n'):
-            line = line.strip()
-            if line.startswith('Q') and ':' in line:
-                if current_question:
-                    quiz_data.append(current_question)
-                current_question = {'question': line, 'options': [], 'answer': '', 'explanation': ''}
-            elif line.startswith(('A)', 'B)', 'C)', 'D)')):
-                current_question['options'].append(line)
-            elif line.startswith('ANSWER:'):
-                current_question['answer'] = line.replace('ANSWER:', '').strip()
-            elif line.startswith('EXPLANATION:'):
-                current_question['explanation'] = line.replace('EXPLANATION:', '').strip()
-        
-        if current_question:
-            quiz_data.append(current_question)
+        # Parse quiz using LLM
+        quiz_data = parse_quiz_with_llm(quiz_content, inputs)
         
         # Interactive quiz
         if not quiz_data:
@@ -641,11 +900,11 @@ Make questions practical and relevant to their role. Cover different aspects of 
         
         for i, q in enumerate(quiz_data, 1):
             print(f"\n{'─'*70}")
-            print(f"\n{q['question']}")
-            for opt in q['options']:
+            print(f"\n{q.get('question', f'Q{i}: Missing question')}")
+            for opt in q.get('options', []):
                 print(f"   {opt}")
             
-            # Get user answer
+            # Get user answer with flexible interpretation
             while True:
                 user_input = input("\nYour answer (A/B/C/D): ").strip().upper()
                 if user_input in ['A', 'B', 'C', 'D']:
@@ -659,7 +918,7 @@ Make questions practical and relevant to their role. Cover different aspects of 
         print("="*70)
         
         for i, (q, user_ans) in enumerate(zip(quiz_data, user_answers), 1):
-            correct_ans = q['answer']
+            correct_ans = q.get('answer', '').strip().upper()
             is_correct = user_ans == correct_ans
             if is_correct:
                 correct_count += 1
@@ -667,20 +926,15 @@ Make questions practical and relevant to their role. Cover different aspects of 
             print(f"\n{'─'*70}")
             print(f"Question {i}: {'✓ CORRECT' if is_correct else '✗ INCORRECT'}")
             print(f"Your answer: {user_ans} | Correct answer: {correct_ans}")
-            if q['explanation']:
+            if q.get('explanation'):
                 print(f"💡 {q['explanation']}")
         
         print(f"\n{'='*70}")
-        print(f"🎯 FINAL SCORE: {correct_count}/{len(quiz_data)} ({correct_count*100//len(quiz_data)}%)")
+        print(f"🎯 FINAL SCORE: {correct_count}/{len(quiz_data)} ({correct_count*100//len(quiz_data) if len(quiz_data) > 0 else 0}%)")
         
-        if correct_count == len(quiz_data):
-            print("🌟 Perfect score! Excellent work!")
-        elif correct_count >= len(quiz_data) * 0.7:
-            print("👍 Great job! You have a solid understanding.")
-        elif correct_count >= len(quiz_data) * 0.5:
-            print("📚 Good effort! Review the topics you missed.")
-        else:
-            print("💪 Keep learning! Review the materials and try again.")
+        # Use LLM for personalized feedback
+        feedback = evaluate_quiz_with_llm(correct_count, len(quiz_data), inputs)
+        print(feedback)
         
         print("="*70)
         
@@ -690,17 +944,104 @@ Make questions practical and relevant to their role. Cover different aspects of 
         print(f"⚠️ Could not generate quiz: {e}")
         return {**inputs, "quiz": "", "quiz_data": []}
 
+def interpret_user_choice(user_input: str, options: dict) -> str:
+    """Use LLM to interpret user's choice flexibly."""
+    # First try exact match
+    if user_input in options:
+        return user_input
+    
+    # Try case-insensitive match
+    for key in options:
+        if user_input.lower() == key.lower():
+            return key
+    
+    # Use LLM for flexible interpretation
+    try:
+        options_str = "\n".join([f"{k}. {v}" for k, v in options.items()])
+        
+        prompt = f"""User entered: "{user_input}"
+
+Available options:
+{options_str}
+
+Which option did the user likely mean? Return ONLY the option number/key (like "1", "2", or "3"), nothing else."""
+
+        response = llm.invoke(prompt)
+        interpreted = response.content.strip() if hasattr(response, 'content') else str(response).strip()
+        interpreted = interpreted.replace('`', '').replace('*', '').replace('.', '').strip()
+        
+        if interpreted in options:
+            return interpreted
+            
+    except Exception as e:
+        pass
+    
+    return None
+
+def generate_dynamic_recommendations(contributors: list, keyword: str, inputs: dict) -> str:
+    """Generate dynamic team connection recommendations using LLM."""
+    try:
+        if not contributors or len(contributors) == 0:
+            return "No specific recommendations available."
+        
+        # Build contributor summary
+        contrib_summary = "\n".join([
+            f"- {c['name']}: {c['commits']} commits, GitHub: @{c.get('github_username', 'N/A')}"
+            for c in contributors[:5]
+        ])
+        
+        prompt = f"""A {inputs['role']} in {inputs['domain']} domain needs to connect with team members about "{keyword}".
+
+Here are the top contributors:
+{contrib_summary}
+
+Generate 2-3 personalized recommendations for who to reach out to and why. Consider:
+- Their contribution level
+- Relevance to the role and domain
+- Practical next steps
+
+Keep it concise and actionable."""
+
+        response = llm.invoke(prompt)
+        recommendations = response.content if hasattr(response, 'content') else str(response)
+        return recommendations.strip()
+        
+    except Exception as e:
+        # Fallback
+        if contributors and len(contributors) > 0:
+            msg = f"• Reach out to {contributors[0]['name']} - most active on this topic"
+            if len(contributors) > 1:
+                msg += f"\n• Also connect with {contributors[1]['name']} for additional insights"
+            return msg
+        return "Consider reaching out to the team members listed above."
+
 def ask_continue(inputs):
-    """Ask what user wants to do next."""
+    """Ask what user wants to do next - with flexible interpretation."""
     print("\n" + "="*70)
     print("🎯 WHAT'S NEXT?")
     print("="*70)
-    print("1. Continue Learning (search more topics)")
-    print("2. Connect with Team (get contact info)")
-    print("3. End Session")
     
-    choice = input("\nYour choice (1/2/3): ").strip()
-    return choice
+    options = {
+        "1": "Continue Learning (search more topics)",
+        "2": "Connect with Team (get contact info)",
+        "3": "End Session"
+    }
+    
+    for key, desc in options.items():
+        print(f"{key}. {desc}")
+    
+    choice = input("\nYour choice (1/2/3 or describe what you want): ").strip()
+    
+    # Use LLM for flexible interpretation
+    interpreted = interpret_user_choice(choice, options)
+    if interpreted:
+        if interpreted != choice:
+            print(f"✓ Understood: {options[interpreted]}")
+        return interpreted
+    
+    # If interpretation fails, default to end
+    print("⚠️ Unclear choice, ending session.")
+    return "3"
 
 def connect_with_team(inputs):
     """Provide team contact information based on actual GitHub contributors."""
@@ -736,9 +1077,10 @@ def connect_with_team(inputs):
             
             print("\n" + "─"*70)
             print("\n💡 RECOMMENDATION:")
-            print(f"   • Reach out to {contributors[0]['name']} - most active on this topic")
-            if len(contributors) > 1:
-                print(f"   • Also connect with {contributors[1]['name']} for additional insights")
+            
+            # Use LLM for dynamic recommendations
+            recommendations = generate_dynamic_recommendations(contributors, keyword, inputs)
+            print(recommendations)
         else:
             print("⚠️ No specific contributors found for this topic.")
     
@@ -804,18 +1146,57 @@ def agentic_onboarding():
             continue  # Continue learning
         elif choice == "2":
             connect_with_team(user_info)
-            # After team connection, ask again
-            if input("\nContinue learning? (yes/no): ").strip().lower() not in ['yes', 'y']:
+            # Use LLM to interpret continue response
+            continue_response = input("\nContinue learning? (yes/no): ").strip().lower()
+            should_continue = interpret_yes_no(continue_response)
+            if not should_continue:
                 break
         elif choice == "3":
+            # Generate dynamic farewell message
+            farewell = generate_farewell(user_info)
             print("\n" + "="*70)
-            print("👋 Thank you for using ERPNext Onboarding!")
-            print("🎓 Keep learning and growing!")
+            print(farewell)
             print("="*70)
             break
         else:
-            print("Invalid choice. Ending session.")
+            print("Ending session.")
             break
+
+def interpret_yes_no(user_input: str) -> bool:
+    """Use LLM to interpret yes/no responses flexibly."""
+    user_input = user_input.lower().strip()
+    
+    # Quick checks first
+    if user_input in ['yes', 'y', 'yeah', 'yep', 'sure', 'ok', 'okay']:
+        return True
+    if user_input in ['no', 'n', 'nope', 'nah']:
+        return False
+    
+    # Use LLM for unclear responses
+    try:
+        prompt = f"""User was asked "Continue learning?" and responded: "{user_input}"
+
+Is this a YES or NO? Reply with ONLY the word YES or NO."""
+
+        response = llm.invoke(prompt)
+        result = response.content.strip().upper() if hasattr(response, 'content') else 'NO'
+        return 'YES' in result
+        
+    except:
+        return False
+
+def generate_farewell(inputs: dict) -> str:
+    """Generate personalized farewell message using LLM."""
+    try:
+        prompt = f"""Generate a warm farewell message for a {inputs['role']} in {inputs['domain']} domain who just completed ERPNext onboarding.
+
+Keep it brief (2-3 lines), encouraging, and personalized to their role. Include relevant emojis."""
+
+        response = llm.invoke(prompt)
+        return response.content.strip() if hasattr(response, 'content') else "👋 Thank you for using ERPNext Onboarding!\n🎓 Keep learning and growing!"
+        
+    except:
+        return "👋 Thank you for using ERPNext Onboarding!\n🎓 Keep learning and growing!"
 
 # ==============================
 # 7. Main Entry Point
