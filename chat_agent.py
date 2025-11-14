@@ -41,6 +41,7 @@ qa_code = None
 
 BASE_URL = "https://docs.frappe.io/erpnext"
 VECTORSTORE_PATH = "erpnext_vectorstore"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")  # Optional: for higher rate limits
 
 # ==============================
 # 3. Load Documentation and Create Vector Store
@@ -141,79 +142,186 @@ def initialize_vectorstores():
 # ==============================
 # 4. Helper Functions
 # ==============================
-def search_github_commits(keyword: str, repo: str = "frappe/erpnext") -> str:
-    """Search GitHub commits for specific keywords."""
-    url = f"https://api.github.com/search/commits?q={keyword}+repo:{repo}&per_page=5"
+def get_github_contributors(keyword: str, repo: str = "frappe/erpnext") -> dict:
+    """Get contributors who worked on a specific topic from commit history."""
+    url = f"https://api.github.com/search/commits?q={keyword}+repo:{repo}&per_page=30"
     headers = {"Accept": "application/vnd.github.cloak-preview"}
+    
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
     
     try:
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code != 200:
-            return f"GitHub API returned status {response.status_code}."
+            return {"error": f"GitHub API returned status {response.status_code}"}
         
         data = response.json()
         commits = data.get("items", [])
         
         if not commits:
-            return f"No commits found for: {keyword}"
+            return {"error": f"No commits found for: {keyword}"}
         
-        result = [f"Recent commits for '{keyword}':\n"]
-        for i, c in enumerate(commits[:5], 1):
-            msg = c['commit']['message'].split('\n')[0][:80]
-            result.append(f"{i}. {msg}\n   {c['html_url']}")
+        # Extract unique contributors
+        contributors = {}
+        for commit in commits:
+            author = commit.get("commit", {}).get("author", {})
+            committer = commit.get("author", {})  # GitHub user info
+            
+            author_name = author.get("name", "Unknown")
+            author_email = author.get("email", "")
+            github_username = committer.get("login", "") if committer else ""
+            github_url = committer.get("html_url", "") if committer else ""
+            
+            # Use email as unique key
+            if author_email and author_email not in contributors:
+                contributors[author_email] = {
+                    "name": author_name,
+                    "email": author_email,
+                    "github_username": github_username,
+                    "github_url": github_url,
+                    "commits": 1
+                }
+            elif author_email:
+                contributors[author_email]["commits"] += 1
+        
+        # Sort by number of commits
+        sorted_contributors = sorted(
+            contributors.values(), 
+            key=lambda x: x["commits"], 
+            reverse=True
+        )
+        
+        return {
+            "contributors": sorted_contributors[:10],  # Top 10
+            "total_commits": len(commits),
+            "keyword": keyword
+        }
+        
+    except Exception as e:
+        return {"error": f"Could not fetch contributors: {str(e)}"}
+
+def search_github_code(keyword: str, repo: str = "frappe/erpnext") -> str:
+    """Search GitHub code repository for specific keywords."""
+    url = f"https://api.github.com/search/code?q={keyword}+repo:{repo}&per_page=5"
+    headers = {"Accept": "application/vnd.github+json"}
+    
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return f"GitHub API returned status {response.status_code}. (Consider adding GITHUB_TOKEN to .env for higher rate limits)"
+        
+        data = response.json()
+        items = data.get("items", [])
+        
+        if not items:
+            return f"No code found for: {keyword}"
+        
+        result = [f"Code files containing '{keyword}':\n"]
+        for i, item in enumerate(items[:5], 1):
+            result.append(f"{i}. {item['name']} (in {item['path']})")
+            result.append(f"   {item['html_url']}\n")
         
         return "\n".join(result)
     except Exception as e:
-        return f"Could not search commits: {str(e)}"
+        return f"Could not search code: {str(e)}"
 
 def extract_domains_and_roles():
-    """Use LLM to extract domains and roles from documentation."""
+    """Use LLM to extract domains and roles - roles generated purely from LLM knowledge."""
     print("🔍 Extracting available domains and roles...")
     
-    # Get sample docs for context
+    # Get comprehensive docs for DOMAINS only
     try:
-        docs = qa_docs.invoke("ERPNext modules and domains")
-        context = "\n".join([doc.page_content[:500] for doc in docs])
+        domain_docs = qa_docs.invoke("ERPNext modules domains accounting manufacturing sales HR purchase projects healthcare")
+        domain_context = "\n".join([doc.page_content[:600] for doc in domain_docs[:5]])
     except Exception as e:
-        print(f"⚠️ Could not fetch docs: {e}")
-        context = "ERPNext has modules for Accounting, HR, Manufacturing, Sales, Purchase, Projects, Healthcare."
+        print(f"⚠️ Could not fetch docs, using general knowledge: {e}")
+        domain_context = "ERPNext documentation covers various business domains and modules."
     
-    domain_prompt = f"""Based on this ERPNext documentation:
-{context}
+    # Extract domains from documentation
+    domain_prompt = f"""Based on this ERPNext documentation context:
 
-List the main ERPNext modules/domains in comma-separated format.
-Include: Accounting, HR, Manufacturing, Sales, Purchase, Projects, Healthcare, etc.
-Return ONLY the comma-separated list."""
+{domain_context}
 
-    role_prompt = """List common roles in ERPNext projects in comma-separated format.
-Include: Developer, Tester, Business Analyst, Solution Architect, System Administrator, Functional Consultant, etc.
-Return ONLY the comma-separated list."""
+List ALL the main ERPNext modules/domains/functional areas. Consider:
+- Core business modules (Accounting, Sales, Purchase, etc.)
+- Industry-specific modules (Manufacturing, Healthcare, Education, etc.)
+- Support modules (HR, Projects, CRM, etc.)
 
+Return ONLY a comma-separated list of module/domain names.
+Example format: Accounting, Sales, Purchase, Manufacturing
+Do NOT include any other text, explanations, or preamble."""
+
+    # Extract roles purely from LLM general knowledge (NO documentation)
+    role_prompt = """You are an expert in ERPNext and ERP implementation projects.
+
+Based on your knowledge of software development and ERP implementation teams, list ALL common roles involved in ERPNext projects.
+
+Consider these categories:
+1. Development roles: Developers, Engineers, etc.
+2. Quality Assurance: Testers, QA Engineers, etc.
+3. Business Analysis: Analysts, Consultants, etc.
+4. Architecture & Design: Architects, Technical Leads, etc.
+5. Administration: System Admins, DevOps, etc.
+6. Project Management: Project Managers, Coordinators, etc.
+7. Functional: Functional Consultants, Domain Experts, etc.
+
+Return ONLY a comma-separated list of role names.
+Example format: Developer, Senior Developer, Tester, Business Analyst, Solution Architect
+Do NOT include any other text, explanations, or preamble."""
+
+    domains = []
+    roles = []
+    
     try:
-        # Use invoke instead of predict for newer versions
+        print("   🤖 Asking LLM for domains (from documentation)...")
         domains_response = llm.invoke(domain_prompt)
-        roles_response = llm.invoke(role_prompt)
-        
-        # Handle different response types
         domains_text = domains_response.content if hasattr(domains_response, 'content') else str(domains_response)
-        roles_text = roles_response.content if hasattr(roles_response, 'content') else str(roles_response)
         
+        # Clean up the response
+        domains_text = domains_text.strip()
+        domains_text = domains_text.replace('`', '').replace('*', '')
+        if '\n' in domains_text:
+            domains_text = domains_text.split('\n')[0]
         
         domains = [d.strip() for d in domains_text.split(",") if d.strip()]
-        roles = [r.strip() for r in roles_text.split(",") if r.strip()]
+        print(f"   ✓ Found {len(domains)} domains from LLM")
         
-        # Fallback to defaults if extraction fails
-        if not domains:
-            domains = ["Accounting", "HR & Payroll", "Manufacturing", "Sales", "Purchase", "Projects", "Healthcare"]
-        if not roles:
-            roles = ["Developer", "Tester", "Business Analyst", "Solution Architect", "System Administrator"]
-            
-        return domains, roles
     except Exception as e:
-        print(f"⚠️ Using default domains/roles due to error: {e}")
-        # Fallback defaults
-        return ["Accounting", "HR & Payroll", "Manufacturing", "Sales", "Purchase", "Projects"], \
-               ["Developer", "Tester", "Business Analyst", "Solution Architect", "System Administrator"]
+        print(f"   ⚠️ LLM domain extraction failed: {e}")
+    
+    try:
+        print("   🤖 Asking LLM for roles (from LLM knowledge only)...")
+        roles_response = llm.invoke(role_prompt)
+        roles_text = roles_response.content if hasattr(roles_response, 'content') else str(roles_response)
+        
+        # Clean up the response
+        roles_text = roles_text.strip()
+        roles_text = roles_text.replace('`', '').replace('*', '')
+        if '\n' in roles_text:
+            roles_text = roles_text.split('\n')[0]
+        
+        roles = [r.strip() for r in roles_text.split(",") if r.strip()]
+        print(f"   ✓ Found {len(roles)} roles from LLM")
+        
+    except Exception as e:
+        print(f"   ⚠️ LLM role extraction failed: {e}")
+    
+    # Only use fallback if LLM completely failed
+    if not domains:
+        print("   ⚠️ Using fallback domains")
+        domains = ["Accounting", "Sales", "Purchase", "Manufacturing", "HR & Payroll", 
+                   "Projects", "Healthcare", "CRM", "Assets", "Stock/Inventory"]
+    
+    if not roles:
+        print("   ⚠️ Using fallback roles")
+        roles = ["Developer", "Tester", "Business Analyst", "Solution Architect", 
+                 "System Administrator", "Functional Consultant", "Project Manager"]
+    
+    print(f"✅ Final: {len(domains)} domains, {len(roles)} roles\n")
+    return domains, roles
 
 # ==============================
 # 5. User Interaction Functions
@@ -385,13 +493,13 @@ def search_materials(inputs):
     
     if not keyword:
         print("No keyword provided.")
-        return {**inputs, "materials_doc": "", "materials_code": "", "commits": ""}
+        return {**inputs, "materials_doc": "", "materials_code": "", "commits": "", "keyword": ""}
     
     print(f"\n🔎 Searching for '{keyword}'...")
     
     # Search documentation
     try:
-        doc_query = f"Explain '{keyword}' for {inputs['role']} in {inputs['domain']} domain"
+        doc_query = f"{keyword} in {inputs['domain']} for {inputs['role']}"
         docs = qa_docs.invoke(doc_query)
         
         if docs:
@@ -403,29 +511,27 @@ Context from documentation:
 {context}
 
 Provide:
-1. What it is
-2. How it works
-3. Practical usage
-4. Key points to know
+1. **What it is**: Brief definition
+2. **How it works**: Technical/functional explanation
+3. **Practical usage**: Real-world application for {inputs['role']}
+4. **Key points**: Important things to remember
 
 Be concise and role-specific."""
             
             response = llm.invoke(prompt)
             doc_result = response.content if hasattr(response, 'content') else str(response)
         else:
-            doc_result = "No documentation found."
+            doc_result = "No documentation found in vectorstore."
     except Exception as e:
         doc_result = f"Error searching docs: {e}"
     
-    # Search code
-    try:
-        code_docs = qa_code.invoke(f"Code implementation of {keyword}")
-        code_result = "\n\n".join([doc.page_content[:500] for doc in code_docs]) if code_docs else "No code snippets found."
-    except Exception as e:
-        code_result = f"Error searching code: {e}"
+    # Search GitHub code
+    print("   🔍 Searching GitHub code repository...")
+    code_result = search_github_code(keyword)
     
-    # Search GitHub commits
-    commits = search_github_commits(keyword)
+    # Get contributors for this topic
+    print("   🔍 Finding team members who worked on this topic...")
+    contributors_data = get_github_contributors(keyword)
     
     # Display results
     print("\n" + "─"*70)
@@ -434,19 +540,44 @@ Be concise and role-specific."""
     print(doc_result)
     
     print("\n" + "─"*70)
-    print("💻 CODE SNIPPETS:")
+    print("💻 CODE REFERENCES:")
     print("─"*70)
-    print(code_result[:1500])
+    print(code_result)
     
     print("\n" + "─"*70)
-    print("🔄 RELATED COMMITS:")
+    print("👥 TEAM MEMBERS WHO WORKED ON THIS:")
     print("─"*70)
-    print(commits)
+    
+    if "error" in contributors_data:
+        print(f"⚠️ {contributors_data['error']}")
+    else:
+        contributors = contributors_data.get("contributors", [])
+        total_commits = contributors_data.get("total_commits", 0)
+        
+        if contributors:
+            print(f"Found {len(contributors)} contributors with {total_commits} related commits:\n")
+            for i, contrib in enumerate(contributors, 1):
+                print(f"{i}. {contrib['name']}")
+                if contrib['github_username']:
+                    print(f"   GitHub: @{contrib['github_username']}")
+                    print(f"   Profile: {contrib['github_url']}")
+                if contrib['email']:
+                    print(f"   Email: {contrib['email']}")
+                print(f"   Commits on this topic: {contrib['commits']}")
+                print()
+        else:
+            print("No contributors found for this topic.")
     
     if "No" in doc_result and "No" in code_result:
-        print("\n💡 TIP: I couldn't find much content. You may want to contact the team for help.")
+        print("\n💡 TIP: Limited results found. Try different keywords or contact the team for guidance.")
     
-    return {**inputs, "materials_doc": doc_result, "materials_code": code_result, "commits": commits}
+    return {
+        **inputs, 
+        "materials_doc": doc_result, 
+        "materials_code": code_result, 
+        "contributors": contributors_data,
+        "keyword": keyword
+    }
 
 def ask_quiz(inputs):
     """Ask if user wants to take a quiz."""
@@ -455,64 +586,109 @@ def ask_quiz(inputs):
     return response in ['yes', 'y']
 
 def present_quiz(inputs):
-    """Generate and present quiz questions."""
+    """Generate and present quiz questions interactively."""
     print("\n" + "="*70)
     print("📝 QUIZ TIME!")
     print("="*70)
     
     prompt = f"""Generate 5 multiple-choice quiz questions for a {inputs['role']} in {inputs['domain']} domain.
 
-Format each question as:
+Format EXACTLY as follows for each question:
 Q1: [Question text]
 A) [Option A]
 B) [Option B]
 C) [Option C]
 D) [Option D]
-Correct Answer: [A/B/C/D]
+ANSWER: [A/B/C/D]
+EXPLANATION: [Brief explanation why this is correct]
 
-Make questions practical and relevant to their role."""
+---
+
+Make questions practical and relevant to their role. Cover different aspects of {inputs['domain']} in ERPNext."""
     
     try:
         response = llm.invoke(prompt)
-        quiz = response.content if hasattr(response, 'content') else str(response)
-        print("\n" + quiz)
-        return {**inputs, "quiz": quiz}
+        quiz_content = response.content if hasattr(response, 'content') else str(response)
+        
+        # Parse quiz into questions and answers
+        quiz_data = []
+        current_question = {}
+        
+        for line in quiz_content.split('\n'):
+            line = line.strip()
+            if line.startswith('Q') and ':' in line:
+                if current_question:
+                    quiz_data.append(current_question)
+                current_question = {'question': line, 'options': [], 'answer': '', 'explanation': ''}
+            elif line.startswith(('A)', 'B)', 'C)', 'D)')):
+                current_question['options'].append(line)
+            elif line.startswith('ANSWER:'):
+                current_question['answer'] = line.replace('ANSWER:', '').strip()
+            elif line.startswith('EXPLANATION:'):
+                current_question['explanation'] = line.replace('EXPLANATION:', '').strip()
+        
+        if current_question:
+            quiz_data.append(current_question)
+        
+        # Interactive quiz
+        if not quiz_data:
+            print("⚠️ Could not parse quiz. Showing raw format:\n")
+            print(quiz_content)
+            return {**inputs, "quiz": quiz_content, "quiz_data": []}
+        
+        user_answers = []
+        correct_count = 0
+        
+        for i, q in enumerate(quiz_data, 1):
+            print(f"\n{'─'*70}")
+            print(f"\n{q['question']}")
+            for opt in q['options']:
+                print(f"   {opt}")
+            
+            # Get user answer
+            while True:
+                user_input = input("\nYour answer (A/B/C/D): ").strip().upper()
+                if user_input in ['A', 'B', 'C', 'D']:
+                    user_answers.append(user_input)
+                    break
+                print("❌ Please enter A, B, C, or D")
+        
+        # Show results after all questions
+        print("\n" + "="*70)
+        print("📊 QUIZ RESULTS")
+        print("="*70)
+        
+        for i, (q, user_ans) in enumerate(zip(quiz_data, user_answers), 1):
+            correct_ans = q['answer']
+            is_correct = user_ans == correct_ans
+            if is_correct:
+                correct_count += 1
+            
+            print(f"\n{'─'*70}")
+            print(f"Question {i}: {'✓ CORRECT' if is_correct else '✗ INCORRECT'}")
+            print(f"Your answer: {user_ans} | Correct answer: {correct_ans}")
+            if q['explanation']:
+                print(f"💡 {q['explanation']}")
+        
+        print(f"\n{'='*70}")
+        print(f"🎯 FINAL SCORE: {correct_count}/{len(quiz_data)} ({correct_count*100//len(quiz_data)}%)")
+        
+        if correct_count == len(quiz_data):
+            print("🌟 Perfect score! Excellent work!")
+        elif correct_count >= len(quiz_data) * 0.7:
+            print("👍 Great job! You have a solid understanding.")
+        elif correct_count >= len(quiz_data) * 0.5:
+            print("📚 Good effort! Review the topics you missed.")
+        else:
+            print("💪 Keep learning! Review the materials and try again.")
+        
+        print("="*70)
+        
+        return {**inputs, "quiz": quiz_content, "quiz_data": quiz_data, "score": f"{correct_count}/{len(quiz_data)}"}
+        
     except Exception as e:
         print(f"⚠️ Could not generate quiz: {e}")
-        return {**inputs, "quiz": ""}
-
-def evaluate_quiz(inputs):
-    """Collect and evaluate quiz answers."""
-    print("\n" + "─"*70)
-    print("Answer the questions above (format: 1A 2C 3B 4D 5A)")
-    answers = input("Your answers: ").strip()
-    
-    if not answers:
-        print("No answers provided.")
-        return inputs
-    
-    prompt = f"""Quiz:
-{inputs.get('quiz', '')}
-
-User's answers: {answers}
-
-Evaluate the answers and provide:
-1. Score (X/5)
-2. Which answers were correct/incorrect
-3. Brief explanation for incorrect answers
-4. Encouraging feedback"""
-    
-    try:
-        response = llm.invoke(prompt)
-        feedback = response.content if hasattr(response, 'content') else str(response)
-        print("\n" + "─"*70)
-        print("📊 QUIZ RESULTS:")
-        print("─"*70)
-        print(feedback)
-    except Exception as e:
-        print(f"⚠️ Could not evaluate quiz: {e}")
-    
-    return inputs
+        return {**inputs, "quiz": "", "quiz_data": []}
 
 def ask_continue(inputs):
     """Ask what user wants to do next."""
@@ -527,28 +703,79 @@ def ask_continue(inputs):
     return choice
 
 def connect_with_team(inputs):
-    """Provide team contact information."""
+    """Provide team contact information based on actual GitHub contributors."""
     print("\n" + "="*70)
     print("👥 TEAM CONNECTIONS")
     print("="*70)
     
-    prompt = f"""For a {inputs['role']} in {inputs['domain']} domain:
+    # Check if we have contributor data from previous search
+    contributors_data = inputs.get("contributors", {})
+    keyword = inputs.get("keyword", inputs['domain'])
+    
+    if not contributors_data or "error" in contributors_data:
+        # Fetch contributors for the domain if not available
+        print(f"🔍 Finding team members who work on {inputs['domain']}...")
+        contributors_data = get_github_contributors(inputs['domain'])
+    
+    # Display actual team members from GitHub
+    if "error" not in contributors_data:
+        contributors = contributors_data.get("contributors", [])
+        
+        if contributors:
+            print(f"\n📋 TEAM MEMBERS WORKING ON {keyword.upper()}:\n")
+            print("─"*70)
+            
+            for i, contrib in enumerate(contributors[:5], 1):  # Show top 5
+                print(f"\n{i}. **{contrib['name']}**")
+                if contrib['github_username']:
+                    print(f"   🔗 GitHub: @{contrib['github_username']}")
+                    print(f"   📍 Profile: {contrib['github_url']}")
+                if contrib['email'] and not contrib['email'].endswith('users.noreply.github.com'):
+                    print(f"   📧 Email: {contrib['email']}")
+                print(f"   💼 Contributions: {contrib['commits']} commits on this topic")
+            
+            print("\n" + "─"*70)
+            print("\n💡 RECOMMENDATION:")
+            print(f"   • Reach out to {contributors[0]['name']} - most active on this topic")
+            if len(contributors) > 1:
+                print(f"   • Also connect with {contributors[1]['name']} for additional insights")
+        else:
+            print("⚠️ No specific contributors found for this topic.")
+    
+    # Generate general guidance using LLM
+    print("\n" + "─"*70)
+    print("📚 GENERAL GUIDANCE:")
+    print("─"*70)
+    
+    prompt = f"""For a {inputs['role']} in {inputs['domain']} domain working on ERPNext:
 
-Suggest:
-1. Who they should contact (role/team)
-2. Relevant communication channels (Slack/Teams)
-3. Documentation resources
-4. Community forums
+Provide practical guidance on:
 
-Be specific and practical."""
+1. **Communication Channels**:
+   - Recommended Slack/Teams channels
+   - Discussion forums or groups
+   - Regular meetings to attend
+
+2. **Learning Resources**:
+   - Documentation to review
+   - Code repositories to explore
+   - Training materials or videos
+
+3. **Best Practices**:
+   - How to effectively collaborate with the team
+   - Questions to ask when stuck
+   - Tools and workflows to familiarize with
+
+Be specific and actionable. Keep it concise (2-4 bullet points total)."""
     
     try:
         response = llm.invoke(prompt)
-        contact_info = response.content if hasattr(response, 'content') else str(response)
-        print("\n" + contact_info)
+        guidance = response.content if hasattr(response, 'content') else str(response)
+        print("\n" + guidance)
     except Exception as e:
-        print(f"⚠️ Error: {e}")
-        print(f"\n💡 Try reaching out to senior {inputs['role']}s in the {inputs['domain']} team!")
+        print(f"⚠️ Error generating guidance: {e}")
+    
+    print("\n" + "="*70)
 
 # ==============================
 # 6. Main Onboarding Loop
@@ -569,7 +796,6 @@ def agentic_onboarding():
         # Offer quiz
         if ask_quiz(user_info):
             user_info = present_quiz(user_info)
-            user_info = evaluate_quiz(user_info)
         
         # Ask what's next
         choice = ask_continue(user_info)
